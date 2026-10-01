@@ -65,3 +65,17 @@ Every object carries metadata tags (source, tool, date, type, document name) for
 # Tech stack
 
 FastAPI, Streamlit, boto3 (AWS S3), Docling, MarkItDown, BeautifulSoup, Azure AI Document Intelligence, AWS Textract. Backend deployed on Render, frontend on Streamlit Community Cloud.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[User] -->|upload PDF or URL| S[Streamlit Frontend]
+    S -->|POST /process-pdf or /process-url| A[FastAPI Backend]
+    A -->|PDF| D{Docling or MarkItDown}
+    A -->|URL| W[BeautifulSoup]
+    D -->|Markdown| B[(AWS S3)]
+    W -->|Markdown| B
+    A -->|S3 key + preview| S
+    S -->|result displayed| U
+```
