@@ -4,7 +4,7 @@ python-multipart
 boto3
 python-dotenv
 docling
-markitdown
+markitdown[pdf]
 requests
 beautifulsoup4
 lxml
