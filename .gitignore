@@ -1,0 +1,7 @@
+.env
+venv/
+ingestion-pipeline_accessKeys.csv
+*.exe
+outputs/
+__pycache__/
+*.pyc
