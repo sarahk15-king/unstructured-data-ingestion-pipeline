@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+boto3
+python-dotenv
+docling
+markitdown
+requests
+beautifulsoup4
+lxml
