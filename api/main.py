@@ -36,7 +36,9 @@ s3 = session.client("s3")
 BUCKET = os.getenv("S3_BUCKET")
 
 # Keeps one request fast enough for a free-tier server.
-MAX_IMAGES = 15
+MAX_IMAGES = 25
+RENDER_DPI = 150
+FIGURE_CAPTION = re.compile(r"^(Figure|Fig\.)\s*\d+\s*[:.]", re.IGNORECASE)
 HEADERS = {"User-Agent": "Mozilla/5.0 (educational data ingestion project)"}
 
 
@@ -102,6 +104,93 @@ def upload_result(doc_name, tool, markdown_text):
     return key
 
 
+def merge_boxes(boxes, gap):
+    """Merge boxes that touch or sit within `gap` points of each other."""
+    clusters = [list(b) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        merged = []
+        while clusters:
+            current = clusters.pop()
+            i = 0
+            while i < len(clusters):
+                other = clusters[i]
+                near = (
+                    current[0] - gap <= other[2] and other[0] - gap <= current[2]
+                    and current[1] - gap <= other[3] and other[1] - gap <= current[3]
+                )
+                if near:
+                    current = [
+                        min(current[0], other[0]), min(current[1], other[1]),
+                        max(current[2], other[2]), max(current[3], other[3]),
+                    ]
+                    clusters.pop(i)
+                    changed = True
+                    i = 0
+                else:
+                    i += 1
+            merged.append(current)
+        clusters = merged
+    return clusters
+
+
+def find_figure_regions(page):
+    """Find figures on a page, including ones drawn with vector graphics.
+
+    Papers usually put the caption ("Figure 2: ...") under the figure, so each caption
+    is used to locate the drawing just above it. Returns boxes as (x0, top, x1, bottom).
+    """
+    captions = [
+        line for line in page.extract_text_lines()
+        if FIGURE_CAPTION.match(line["text"].strip())
+    ]
+    if not captions:
+        return []
+
+    page_area = page.width * page.height
+    boxes = []
+    for kind in ("curve", "line", "rect", "image"):
+        for obj in page.objects.get(kind, []):
+            width = obj["x1"] - obj["x0"]
+            height = obj["bottom"] - obj["top"]
+            if width * height > 0.7 * page_area:
+                continue  # page background
+            boxes.append((obj["x0"], obj["top"], obj["x1"], obj["bottom"]))
+    if not boxes or len(boxes) > 3000:
+        return []
+
+    words = page.extract_words()
+    regions = []
+    for caption in captions:
+        above = [b for b in boxes if b[3] <= caption["top"] + 2]
+        candidates = [
+            c for c in merge_boxes(above, gap=20)
+            if caption["top"] - 80 <= c[3] <= caption["top"] + 3
+            and (c[2] - c[0]) >= 80 and (c[3] - c[1]) >= 50
+        ]
+        if not candidates:
+            continue
+        x0, top, x1, bottom = max(candidates, key=lambda c: (c[2] - c[0]) * (c[3] - c[1]))
+
+        # Pull in the labels that sit on or around the drawing
+        for w in words:
+            cx = (w["x0"] + w["x1"]) / 2
+            cy = (w["top"] + w["bottom"]) / 2
+            if x0 - 10 <= cx <= x1 + 10 and top - 10 <= cy <= bottom + 10 and w["bottom"] <= caption["top"]:
+                x0, top = min(x0, w["x0"]), min(top, w["top"])
+                x1, bottom = max(x1, w["x1"]), max(bottom, w["bottom"])
+
+        pad = 6
+        regions.append((
+            max(x0 - pad, page.bbox[0]),
+            max(top - pad, page.bbox[1]),
+            min(x1 + pad, page.bbox[2]),
+            min(bottom + pad, caption["top"] - 1),
+        ))
+    return regions
+
+
 def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     """Pull text, tables and images out of a PDF and upload each one to S3 on its own."""
     import pdfplumber
@@ -124,20 +213,50 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 key = f"processed/extracted/pdf/{doc_name}/tables/{name}.csv"
                 table_summaries.append(upload_table(key, name, rows, table_meta))
 
+            # Images: figures (including vector drawings) first, then embedded pictures
+            if len(image_keys) >= MAX_IMAGES:
+                continue
+            try:
+                figures = find_figure_regions(page)
+            except Exception as e:
+                figures = []
+                warnings.append(f"Could not look for figures on page {page_num}: {e}")
+
+            pictures = []
             for img_idx, img in enumerate(page.images):
+                # Clamp to the page so images that overhang the edge are still saved.
+                box = (
+                    max(img["x0"], page.bbox[0]), max(img["top"], page.bbox[1]),
+                    min(img["x1"], page.bbox[2]), min(img["bottom"], page.bbox[3]),
+                )
+                if box[2] - box[0] < 20 or box[3] - box[1] < 20:
+                    continue
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                inside_figure = any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures)
+                if not inside_figure:  # pictures inside a saved figure are already part of it
+                    pictures.append((f"page{page_num}_img{img_idx}", box))
+
+            to_save = [(f"page{page_num}_figure{i}", box) for i, box in enumerate(figures)] + pictures
+            if not to_save:
+                continue
+
+            try:
+                page_image = page.to_image(resolution=RENDER_DPI).original
+            except Exception as e:
+                warnings.append(f"Could not render page {page_num} to save its images: {e}")
+                continue
+            scale = RENDER_DPI / 72
+            for name, box in to_save:
                 if len(image_keys) >= MAX_IMAGES:
                     break
                 try:
-                    # Clamp to the page so images that overhang the edge are still saved.
-                    x0 = max(img["x0"], page.bbox[0])
-                    top = max(img["top"], page.bbox[1])
-                    x1 = min(img["x1"], page.bbox[2])
-                    bottom = min(img["bottom"], page.bbox[3])
-                    if x1 - x0 < 20 or bottom - top < 20:
-                        continue
+                    crop = page_image.crop((
+                        int((box[0] - page.bbox[0]) * scale), int((box[1] - page.bbox[1]) * scale),
+                        int((box[2] - page.bbox[0]) * scale), int((box[3] - page.bbox[1]) * scale),
+                    ))
                     buffer = io.BytesIO()
-                    page.within_bbox((x0, top, x1, bottom)).to_image(resolution=120).save(buffer, format="PNG")
-                    key = f"assets/images/api-uploads/{doc_name}/page{page_num}_img{img_idx}.png"
+                    crop.save(buffer, format="PNG")
+                    key = f"assets/images/api-uploads/{doc_name}/{name}.png"
                     put_object(
                         key,
                         buffer.getvalue(),
@@ -146,7 +265,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                     )
                     image_keys.append(key)
                 except Exception as e:
-                    warnings.append(f"Skipped an image on page {page_num}: {e}")
+                    warnings.append(f"Skipped {name}: {e}")
 
     text_key = put_json(
         f"processed/extracted/pdf/{doc_name}/text.json",
