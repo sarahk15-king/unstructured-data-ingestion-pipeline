@@ -5,7 +5,28 @@ API_URL = "https://ingestion-pipeline-api.onrender.com"
 
 st.set_page_config(page_title="Unstructured Data Ingestion Pipeline", layout="wide")
 st.title("Unstructured Data Ingestion Pipeline")
-st.caption("Upload a PDF or submit a URL to convert it to Markdown and store it in S3.")
+st.caption("Upload a PDF or submit a URL to convert it to Markdown and store the text, tables and images in S3.")
+
+
+def show_result(result):
+    uploaded = result.get("uploaded", {})
+
+    st.success(f"Done! Extracted {result['markdown_length']} characters")
+    st.write(f"**S3 location (Markdown):** `{result['s3_url']}`")
+    st.write(
+        f"**Tables found:** {uploaded.get('table_count', 0)}  |  "
+        f"**Images uploaded:** {uploaded.get('image_count', 0)}"
+    )
+
+    with st.expander("Everything uploaded to S3"):
+        st.json(uploaded)
+
+    for warning in result.get("warnings", []):
+        st.warning(warning)
+
+    st.markdown("**Preview:**")
+    st.text_area("Markdown preview", result["markdown_preview"], height=300)
+
 
 tab1, tab2 = st.tabs(["Upload PDF", "Submit URL"])
 
@@ -20,12 +41,7 @@ with tab1:
             try:
                 response = requests.post(f"{API_URL}/process-pdf", files=files, data=data, timeout=300)
                 response.raise_for_status()
-                result = response.json()
-
-                st.success(f"Done! Extracted {result['markdown_length']} characters")
-                st.write(f"**S3 location:** `{result['s3_url']}`")
-                st.markdown("**Preview:**")
-                st.text_area("Markdown preview", result["markdown_preview"], height=300)
+                show_result(response.json())
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -35,13 +51,8 @@ with tab2:
     if st.button("Process URL", disabled=not url):
         with st.spinner("Processing URL..."):
             try:
-                response = requests.post(f"{API_URL}/process-url", data={"url": url}, timeout=60)
+                response = requests.post(f"{API_URL}/process-url", data={"url": url}, timeout=120)
                 response.raise_for_status()
-                result = response.json()
-
-                st.success(f"Done! Extracted {result['markdown_length']} characters")
-                st.write(f"**S3 location:** `{result['s3_url']}`")
-                st.markdown("**Preview:**")
-                st.text_area("Markdown preview", result["markdown_preview"], height=300)
+                show_result(response.json())
             except Exception as e:
                 st.error(f"Error: {e}")
