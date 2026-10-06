@@ -41,8 +41,18 @@ def show_result(result):
     for warning in result.get("warnings", []):
         st.warning(warning)
 
+    markdown_text = result.get("markdown_text", result["markdown_preview"])
+    file_name = result["s3_key"].rsplit("/", 1)[-1]
+    st.download_button(
+        "Download Markdown",
+        data=markdown_text,
+        file_name=file_name,
+        mime="text/markdown",
+        key=f"download_{result['s3_key']}",
+    )
+
     st.markdown("**Preview:**")
-    st.text_area("Markdown preview", result["markdown_preview"], height=300)
+    st.text_area("Markdown preview", markdown_text[:3000], height=300)
 
 
 tab1, tab2 = st.tabs(["Upload PDF", "Submit URL"])
@@ -65,9 +75,13 @@ with tab1:
             try:
                 response = requests.post(f"{API_URL}/process-pdf", files=files, data=data, timeout=300)
                 response.raise_for_status()
-                show_result(response.json())
+                st.session_state["pdf_result"] = response.json()
             except Exception as e:
+                st.session_state.pop("pdf_result", None)
                 st.error(f"Error: {e}")
+
+    if "pdf_result" in st.session_state:
+        show_result(st.session_state["pdf_result"])
 
 with tab2:
     url = st.text_input("Enter a web page URL", placeholder="https://en.wikipedia.org/wiki/...")
@@ -77,6 +91,10 @@ with tab2:
             try:
                 response = requests.post(f"{API_URL}/process-url", data={"url": url}, timeout=120)
                 response.raise_for_status()
-                show_result(response.json())
+                st.session_state["url_result"] = response.json()
             except Exception as e:
+                st.session_state.pop("url_result", None)
                 st.error(f"Error: {e}")
+
+    if "url_result" in st.session_state:
+        show_result(st.session_state["url_result"])
