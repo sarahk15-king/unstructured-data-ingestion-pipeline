@@ -93,6 +93,18 @@ def convert_pdf(file_path, tool):
         raise ValueError("tool must be 'docling' or 'markitdown'")
 
 
+def add_image_links(markdown_text, image_keys):
+    """Append links to the images saved in S3 so the Markdown points to where they are stored."""
+    if not image_keys:
+        return markdown_text
+    lines = ["", "## Extracted images", ""]
+    for key in image_keys:
+        name = key.rsplit("/", 1)[-1]
+        lines.append(f"![{name}](s3://{BUCKET}/{key})")
+        lines.append("")
+    return markdown_text.rstrip() + "\n" + "\n".join(lines)
+
+
 def upload_result(doc_name, tool, markdown_text):
     key = f"processed/markdown/{tool}/api-uploads/{doc_name}.md"
     put_object(
@@ -313,19 +325,22 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
             },
         )
 
-        # 2. Whole document as Markdown
-        markdown_text = convert_pdf(tmp_path, tool)
-        markdown_key = upload_result(doc_name, tool, markdown_text)
-
-        # 3. Text, tables and images as separate files
-        uploaded = {"original_pdf": original_key, "markdown": markdown_key}
+        # 2. Text, tables and images as separate files
+        uploaded = {"original_pdf": original_key}
         table_summaries = []
         warnings = []
+        image_keys = []
         try:
             parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
             uploaded.update(parts)
+            image_keys = parts["image_keys"]
         except Exception as e:
             warnings.append(f"Text, table and image extraction failed: {e}")
+
+        # 3. Whole document as Markdown, with links to the images saved in S3
+        markdown_text = add_image_links(convert_pdf(tmp_path, tool), image_keys)
+        markdown_key = upload_result(doc_name, tool, markdown_text)
+        uploaded["markdown"] = markdown_key
 
         return {
             "filename": file.filename,
@@ -333,6 +348,7 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
             "s3_key": markdown_key,
             "s3_url": f"s3://{BUCKET}/{markdown_key}",
             "markdown_preview": markdown_text[:1000],
+            "markdown_text": markdown_text,
             "markdown_length": len(markdown_text),
             "uploaded": uploaded,
             "tables": table_summaries,
@@ -370,7 +386,6 @@ def process_url(url: str = Form(...)):
     meta = {"source": "api-upload-url", "document": doc_name, "date": today}
 
     markdown_key = f"processed/markdown/web/api-uploads/{doc_name}.md"
-    put_object(markdown_key, markdown_text.encode("utf-8"), "text/markdown", {**meta, "type": "markdown"})
     text_key = put_json(f"raw/web/{doc_name}/{today}/text.json", text_elements, {**meta, "type": "text"})
 
     # Tables: each one becomes its own CSV file
@@ -418,11 +433,16 @@ def process_url(url: str = Form(...)):
         except Exception as e:
             warnings.append(f"Skipped an image ({full_url}): {e}")
 
+    # Markdown is uploaded last so it can link to the images saved above
+    markdown_text = add_image_links(markdown_text, image_keys)
+    put_object(markdown_key, markdown_text.encode("utf-8"), "text/markdown", {**meta, "type": "markdown"})
+
     return {
         "url": url,
         "s3_key": markdown_key,
         "s3_url": f"s3://{BUCKET}/{markdown_key}",
         "markdown_preview": markdown_text[:1000],
+        "markdown_text": markdown_text,
         "markdown_length": len(markdown_text),
         "uploaded": {
             "markdown": markdown_key,
