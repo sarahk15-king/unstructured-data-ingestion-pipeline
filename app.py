@@ -1,5 +1,6 @@
-import streamlit as st
+import pandas as pd
 import requests
+import streamlit as st
 
 API_URL = "https://ingestion-pipeline-api.onrender.com"
 
@@ -20,6 +21,19 @@ def show_result(result):
 
     with st.expander("Everything uploaded to S3"):
         st.json(uploaded)
+
+    tables = result.get("tables", [])
+    if tables:
+        st.markdown(f"**Tables ({len(tables)}), each saved as its own CSV file:**")
+        for table in tables:
+            with st.expander(f"{table['name']}  ({table['row_count']} rows)"):
+                st.caption(f"S3 key: `{table['key']}`")
+                preview = table["preview"]
+                width = max(len(row) for row in preview)
+                padded = [row + [""] * (width - len(row)) for row in preview]
+                st.dataframe(pd.DataFrame(padded))
+                if table["row_count"] > len(preview):
+                    st.caption(f"Showing the first {len(preview)} of {table['row_count']} rows.")
 
     for warning in result.get("warnings", []):
         st.warning(warning)
