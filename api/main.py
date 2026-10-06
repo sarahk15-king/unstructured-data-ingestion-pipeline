@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import os
@@ -60,6 +61,21 @@ def put_json(key, data, metadata):
     return put_object(key, body, "application/json", metadata)
 
 
+def upload_table(key, name, rows, metadata):
+    """Upload one table as its own CSV file and return a short summary of it."""
+    clean_rows = [["" if cell is None else str(cell).replace("\n", " ") for cell in row] for row in rows]
+    buffer = io.StringIO()
+    csv.writer(buffer).writerows(clean_rows)
+    # utf-8-sig so Excel opens the file with the right characters
+    put_object(key, buffer.getvalue().encode("utf-8-sig"), "text/csv", {**metadata, "type": "table"})
+    return {
+        "name": name,
+        "key": key,
+        "row_count": len(clean_rows),
+        "preview": [[cell[:120] for cell in row] for row in clean_rows[:8]],
+    }
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         from docling.document_converter import DocumentConverter
@@ -91,16 +107,22 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     import pdfplumber
 
     pages_text = []
-    tables = []
+    table_summaries = []
     image_keys = []
     warnings = []
+    table_meta = {"source": "api-upload", "document": doc_name, "date": today}
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
             pages_text.append({"page": page_num, "text": page.extract_text() or ""})
 
+            # Each table becomes its own CSV file
             for t_idx, rows in enumerate(page.extract_tables()):
-                tables.append({"page": page_num, "table_index": t_idx, "rows": rows})
+                if not rows:
+                    continue
+                name = f"page{page_num}_table{t_idx}"
+                key = f"processed/extracted/pdf/{doc_name}/tables/{name}.csv"
+                table_summaries.append(upload_table(key, name, rows, table_meta))
 
             for img_idx, img in enumerate(page.images):
                 if len(image_keys) >= MAX_IMAGES:
@@ -126,25 +148,20 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 except Exception as e:
                     warnings.append(f"Skipped an image on page {page_num}: {e}")
 
-    base = f"processed/extracted/pdf/{doc_name}"
     text_key = put_json(
-        f"{base}/text.json",
+        f"processed/extracted/pdf/{doc_name}/text.json",
         pages_text,
         {"source": "api-upload", "document": doc_name, "date": today, "type": "text"},
     )
-    tables_key = put_json(
-        f"{base}/tables.json",
-        tables,
-        {"source": "api-upload", "document": doc_name, "date": today, "type": "tables"},
-    )
 
-    return {
+    parts = {
         "text": text_key,
-        "tables": tables_key,
-        "table_count": len(tables),
+        "table_count": len(table_summaries),
+        "table_keys": [t["key"] for t in table_summaries],
         "image_count": len(image_keys),
         "image_keys": image_keys,
-    }, warnings
+    }
+    return parts, table_summaries, warnings
 
 
 @app.get("/")
@@ -183,9 +200,10 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
 
         # 3. Text, tables and images as separate files
         uploaded = {"original_pdf": original_key, "markdown": markdown_key}
+        table_summaries = []
         warnings = []
         try:
-            parts, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
+            parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
             uploaded.update(parts)
         except Exception as e:
             warnings.append(f"Text, table and image extraction failed: {e}")
@@ -198,6 +216,7 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
             "markdown_preview": markdown_text[:1000],
             "markdown_length": len(markdown_text),
             "uploaded": uploaded,
+            "tables": table_summaries,
             "warnings": warnings,
         }
     finally:
@@ -229,8 +248,14 @@ def process_url(url: str = Form(...)):
             lines.append(f"{prefix} {text}" if prefix else text)
     markdown_text = "\n\n".join(lines)
 
-    # Tables
-    tables = []
+    meta = {"source": "api-upload-url", "document": doc_name, "date": today}
+
+    markdown_key = f"processed/markdown/web/api-uploads/{doc_name}.md"
+    put_object(markdown_key, markdown_text.encode("utf-8"), "text/markdown", {**meta, "type": "markdown"})
+    text_key = put_json(f"raw/web/{doc_name}/{today}/text.json", text_elements, {**meta, "type": "text"})
+
+    # Tables: each one becomes its own CSV file
+    table_summaries = []
     for t_idx, table in enumerate(soup.find_all("table")):
         rows = []
         for tr in table.find_all("tr"):
@@ -238,14 +263,9 @@ def process_url(url: str = Form(...)):
             if cells:
                 rows.append(cells)
         if rows:
-            tables.append({"table_index": t_idx, "rows": rows})
-
-    meta = {"source": "api-upload-url", "document": doc_name, "date": today}
-
-    markdown_key = f"processed/markdown/web/api-uploads/{doc_name}.md"
-    put_object(markdown_key, markdown_text.encode("utf-8"), "text/markdown", {**meta, "type": "markdown"})
-    text_key = put_json(f"raw/web/{doc_name}/{today}/text.json", text_elements, {**meta, "type": "text"})
-    tables_key = put_json(f"raw/web/{doc_name}/{today}/tables.json", tables, {**meta, "type": "tables"})
+            name = f"table_{t_idx}"
+            key = f"raw/web/{doc_name}/{today}/tables/{name}.csv"
+            table_summaries.append(upload_table(key, name, rows, meta))
 
     # Images (the first few real ones, skipping tiny icons)
     image_keys = []
@@ -288,10 +308,11 @@ def process_url(url: str = Form(...)):
         "uploaded": {
             "markdown": markdown_key,
             "text": text_key,
-            "tables": tables_key,
-            "table_count": len(tables),
+            "table_count": len(table_summaries),
+            "table_keys": [t["key"] for t in table_summaries],
             "image_count": len(image_keys),
             "image_keys": image_keys,
         },
+        "tables": table_summaries,
         "warnings": warnings,
     }
