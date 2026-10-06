@@ -1,8 +1,7 @@
 import os
+import json
 from pathlib import Path
-from urllib.parse import urlparse
 
-import requests
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
@@ -12,33 +11,23 @@ load_dotenv()
 ENDPOINT = os.getenv("AZURE_DOCINTEL_ENDPOINT")
 KEY = os.getenv("AZURE_DOCINTEL_KEY")
 
-URLS = [
-    "https://en.wikipedia.org/wiki/Extract,_transform,_load",
-    "https://en.wikipedia.org/wiki/List_of_tallest_buildings",
-    "https://en.wikipedia.org/wiki/Periodic_table",
-]
-HEADERS = {"User-Agent": "ingestion-pipeline-demo/1.0 (learning project)"}
-
-OUTPUT_DIR = Path("outputs/azure_web")
+PDF_DIR = Path("data/pdfs")
+OUTPUT_DIR = Path("outputs/azure")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
 
 
-def process_url(url):
-    doc_name = urlparse(url).path.strip("/").split("/")[-1].replace(",", "")
+def process_pdf(pdf_path):
+    doc_name = pdf_path.stem
     print(f"\nProcessing with Azure: {doc_name}")
 
-    # Download the page, then send its HTML to Azure's layout model
-    html = requests.get(url, headers=HEADERS, timeout=30)
-    html.raise_for_status()
-
-    poller = client.begin_analyze_document(
-        "prebuilt-layout",
-        body=html.content,
-        content_type="text/html",
-        output_content_format="markdown",
-    )
+    with open(pdf_path, "rb") as f:
+        poller = client.begin_analyze_document(
+            "prebuilt-layout",
+            body=f,
+            output_content_format="markdown",
+        )
     result = poller.result()
 
     markdown_text = result.content
@@ -50,8 +39,9 @@ def process_url(url):
 
 
 if __name__ == "__main__":
-    for page_url in URLS:
-        try:
-            process_url(page_url)
-        except Exception as e:
-            print(f"  Failed: {e}")
+    pdf_files = list(PDF_DIR.glob("*.pdf"))
+    if not pdf_files:
+        print(f"No PDFs found in {PDF_DIR}")
+    else:
+        for pdf_file in pdf_files:
+            process_pdf(pdf_file)
