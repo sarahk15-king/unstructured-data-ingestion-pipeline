@@ -51,12 +51,22 @@ MarkItDown lost word spacing and mangled complex layouts/formulas.
 
 ## Cost
 
-- Open-source & Docling/MarkItDown: free, only compute cost.
-- Azure Document Intelligence: pay-per-page, free tier (F0) for low
-  volume with file size limits.
-- AWS Textract: pay-per-page, similar pricing model.
-- At the scale tested here (a handful of documents), cost is
-  negligible for all approaches.
+All testing in this project used free tiers or free tools, so the actual cost was $0.
+
+| Approach | What I used | Minimum cost |
+|---|---|---|
+| Open-source libraries (pypdf, pdfplumber, BeautifulSoup) | Free libraries on my own machine | $0 |
+| Docling / MarkItDown | Free libraries on my own machine; the deployed app runs on Render's free tier | $0 (only compute) |
+| Azure Document Intelligence | Free tier (F0): 500 pages per month, 4 MB file limit, first 2 pages of each document only | $0 on the free tier; the paid layout model is roughly $10 per 1,000 pages |
+| AWS Textract | Could not run on my free AWS plan; it needs an upgrade to a paid plan | Text only: $1.50 per 1,000 pages. Tables and forms: $65 per 1,000 pages |
+
+- At the scale tested here (3 PDFs, about 32 pages), the paid options would cost very little:
+  roughly $0.32 for Azure's layout model and about $2.08 for Textract with tables and forms,
+  as in my script.
+- Textract's own free tier (for new AWS customers, 3 months) covers 1,000 pages of text detection
+  and 100 pages of table and form analysis per month, but the service still needs the paid plan.
+- Azure's price is approximate, because the sources I found disagree. Confirm it on Azure's
+  pricing page before relying on it.
 
 ## Scalability and integration
 
