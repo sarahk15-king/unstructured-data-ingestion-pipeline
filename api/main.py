@@ -39,6 +39,7 @@ BUCKET = os.getenv("S3_BUCKET")
 MAX_IMAGES = 25
 RENDER_DPI = 150
 FIGURE_CAPTION = re.compile(r"^(Figure|Fig\.)\s*\d+\s*[:.]", re.IGNORECASE)
+TABLE_CAPTION = re.compile(r"^(Table\s*\d+\s*[:.]|TABLE\s*[IVX]+\s*([:.]|$))")
 PANEL_LABEL = re.compile(r"^\(?([a-h])\)$", re.IGNORECASE)
 HEADERS = {"User-Agent": "Mozilla/5.0 (educational data ingestion project)"}
 
@@ -263,6 +264,120 @@ def split_panels(page, box):
     return [(letter, (edges[i], top, edges[i + 1], bottom)) for i, (_, letter, _) in enumerate(labels)]
 
 
+def find_caption_tables(page, max_rule_gap=70):
+    """Find tables that have no ruled grid, using their "Table N:" caption and horizontal rules.
+
+    Papers usually draw only a few horizontal lines (top, header, bottom) and put the caption
+    just above. The table is the area from the caption down to the last of those lines.
+    Returns a list of boxes as (x0, top, x1, bottom).
+    """
+    captions = [
+        line for line in page.extract_text_lines()
+        if TABLE_CAPTION.match(line["text"].strip())
+    ]
+    rules = sorted(
+        (
+            line for line in page.objects.get("line", [])
+            if abs(line["bottom"] - line["top"]) < 2 and line["x1"] - line["x0"] > 40
+        ),
+        key=lambda line: line["top"],
+    )
+    boxes = []
+    for i, caption in enumerate(captions):
+        limit = captions[i + 1]["top"] if i + 1 < len(captions) else page.height
+        below = [r for r in rules if caption["bottom"] - 2 <= r["top"] < limit - 2]
+        if not below or below[0]["top"] - caption["bottom"] > 45:
+            continue
+        group = [below[0]]
+        for rule in below[1:]:
+            if rule["top"] - group[-1]["top"] <= max_rule_gap:
+                group.append(rule)
+            else:
+                break
+        if len(group) < 2:
+            continue
+        boxes.append((
+            max(min(r["x0"] for r in group) - 2, page.bbox[0]),
+            group[0]["top"] - 2,
+            min(max(r["x1"] for r in group) + 2, page.bbox[2]),
+            group[-1]["top"] + 2,
+        ))
+    return boxes
+
+
+def clean_rows(rows):
+    """Remove empty rows and empty columns from a table."""
+    rows = [[(cell or "").strip() for cell in row] for row in rows]
+    rows = [row for row in rows if any(row)]
+    if not rows:
+        return []
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    keep = [c for c in range(width) if any(row[c] for row in rows)]
+    return [[row[c] for c in keep] for row in rows]
+
+
+def overlap_share(box, other):
+    """How much of `box` is covered by `other` (0 to 1)."""
+    w = min(box[2], other[2]) - max(box[0], other[0])
+    h = min(box[3], other[3]) - max(box[1], other[1])
+    if w <= 0 or h <= 0:
+        return 0
+    return (w * h) / ((box[2] - box[0]) * (box[3] - box[1]))
+
+
+def extract_page_tables(page, figures):
+    """Return the real tables on a page as lists of rows.
+
+    First the tables with a ruled grid, then tables found from their caption and rules.
+    """
+    found = []
+    boxes = []
+    for table in page.find_tables():
+        rows = table.extract()
+        if looks_like_table(table.bbox, rows, figures):
+            found.append(clean_rows(rows))
+            boxes.append(table.bbox)
+
+    for box in find_caption_tables(page):
+        if any(overlap_share(box, b) > 0.3 for b in boxes):
+            continue  # already found as a ruled table
+        if any(overlap_share(box, f) > 0.5 for f in figures):
+            continue
+        rows = page.crop(box).extract_table({
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "text_x_tolerance": 3,
+        })
+        rows = clean_rows(rows or [])
+        if looks_like_table(box, rows, figures):
+            found.append(rows)
+            boxes.append(box)
+    return found
+
+
+def looks_like_table(bbox, rows, figures):
+    """Reject boxes that pdfplumber found but that are not real tables.
+
+    A real table has at least two rows and two columns with most cells filled in, and it does
+    not sit inside a figure (such as the number grids drawn in a diagram).
+    """
+    if not rows or len(rows) < 2:
+        return False
+    columns = max(len(row) for row in rows)
+    if columns < 2:
+        return False
+    cells = [cell for row in rows for cell in row]
+    filled = sum(1 for cell in cells if cell and cell.strip())
+    if filled < 4 or filled / len(cells) < 0.5:
+        return False
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    if any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures):
+        return False
+    return True
+
+
 def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     """Pull text, tables and images out of a PDF and upload each one to S3 on its own."""
     import pdfplumber
@@ -277,22 +392,22 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
         for page_num, page in enumerate(pdf.pages, start=1):
             pages_text.append({"page": page_num, "text": page.extract_text() or ""})
 
-            # Each table becomes its own CSV file
-            for t_idx, rows in enumerate(page.extract_tables()):
-                if not rows:
-                    continue
-                name = f"page{page_num}_table{t_idx}"
+            # Figures are found first, so numbers inside a figure are not mistaken for a table
+            try:
+                figures = find_figure_regions(page)
+            except Exception as e:
+                figures = []
+                warnings.append(f"Could not look for figures on page {page_num}: {e}")
+
+            # Each real table becomes its own CSV file
+            for kept, rows in enumerate(extract_page_tables(page, figures)):
+                name = f"page{page_num}_table{kept}"
                 key = f"processed/extracted/pdf/{doc_name}/tables/{name}.csv"
                 table_summaries.append(upload_table(key, name, rows, table_meta))
 
             # Images: figures (including vector drawings) first, then embedded pictures
             if len(image_keys) >= MAX_IMAGES:
                 continue
-            try:
-                figures = find_figure_regions(page)
-            except Exception as e:
-                figures = []
-                warnings.append(f"Could not look for figures on page {page_num}: {e}")
 
             pictures = []
             for img_idx, img in enumerate(page.images):
