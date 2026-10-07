@@ -39,6 +39,7 @@ BUCKET = os.getenv("S3_BUCKET")
 MAX_IMAGES = 25
 RENDER_DPI = 150
 FIGURE_CAPTION = re.compile(r"^(Figure|Fig\.)\s*\d+\s*[:.]", re.IGNORECASE)
+PANEL_LABEL = re.compile(r"^\(?([a-h])\)$", re.IGNORECASE)
 HEADERS = {"User-Agent": "Mozilla/5.0 (educational data ingestion project)"}
 
 
@@ -203,6 +204,65 @@ def find_figure_regions(page):
     return regions
 
 
+def split_panels(page, box):
+    """Split a figure into its labelled panels, such as (a), (b), (c) printed under it.
+
+    Returns a list of (letter, box). Returns an empty list if fewer than two labels are found.
+    """
+    x0, top, x1, bottom = box
+    labels = []
+    for w in page.extract_words():
+        match = PANEL_LABEL.match(w["text"].strip())
+        cx = (w["x0"] + w["x1"]) / 2
+        cy = (w["top"] + w["bottom"]) / 2
+        if match and x0 <= cx <= x1 and bottom - 30 <= cy <= bottom + 25:
+            labels.append((cx, match.group(1).lower(), w["bottom"]))
+    labels.sort()
+    if len(labels) < 2 or len({letter for _, letter, _ in labels}) != len(labels):
+        return []
+
+    # Include the (a), (b), (c) labels themselves at the bottom of each panel
+    bottom = max(bottom, max(label_bottom for _, _, label_bottom in labels) + 4)
+    # Cut each pair of panels in the widest empty gap between their labels
+    spans = []
+    for kind in ("rect", "curve", "line", "image", "char"):
+        for obj in page.objects.get(kind, []):
+            if obj["bottom"] >= top and obj["top"] <= bottom and obj["x1"] > x0 and obj["x0"] < x1:
+                if obj["x1"] - obj["x0"] > 0.9 * (x1 - x0):
+                    continue  # a box behind the whole figure does not separate panels
+                spans.append((obj["x0"], obj["x1"]))
+    spans.sort()
+
+    # Panels often sit on their own coloured box, so a large box that starts between two
+    # labels marks where the next panel begins
+    backgrounds = []
+    for kind in ("rect", "curve"):
+        for obj in page.objects.get(kind, []):
+            width, height = obj["x1"] - obj["x0"], obj["bottom"] - obj["top"]
+            if 0.1 * (x1 - x0) < width <= 0.9 * (x1 - x0) and height > 0.5 * (bottom - top) \
+                    and obj["top"] >= top - 5 and obj["bottom"] <= bottom + 5:
+                backgrounds.append(obj["x0"])
+
+    def best_cut(left, right):
+        starts = [b for b in backgrounds if left < b < right]
+        if starts:
+            return min(starts) - 1.5
+        gaps, edge = [], left
+        for s0, s1 in spans:
+            if s1 <= left or s0 >= right:
+                continue
+            if s0 > edge:
+                gaps.append((s0 - edge, (edge + s0) / 2))
+            edge = max(edge, s1)
+        if right > edge:
+            gaps.append((right - edge, (edge + right) / 2))
+        widest = max(gaps) if gaps else None
+        return widest[1] if widest and widest[0] >= 4 else (left + right) / 2
+
+    edges = [x0] + [best_cut(labels[i][0], labels[i + 1][0]) for i in range(len(labels) - 1)] + [x1]
+    return [(letter, (edges[i], top, edges[i + 1], bottom)) for i, (_, letter, _) in enumerate(labels)]
+
+
 def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     """Pull text, tables and images out of a PDF and upload each one to S3 on its own."""
     import pdfplumber
@@ -248,7 +308,13 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 if not inside_figure:  # pictures inside a saved figure are already part of it
                     pictures.append((f"page{page_num}_img{img_idx}", box))
 
-            to_save = [(f"page{page_num}_figure{i}", box) for i, box in enumerate(figures)] + pictures
+            to_save = []
+            for i, box in enumerate(figures):
+                to_save.append((f"page{page_num}_figure{i}", box))
+                # Also save each labelled panel (a), (b), (c) as its own image
+                for letter, panel_box in split_panels(page, box):
+                    to_save.append((f"page{page_num}_figure{i}_{letter}", panel_box))
+            to_save += pictures
             if not to_save:
                 continue
 
