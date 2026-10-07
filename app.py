@@ -69,7 +69,7 @@ with tab1:
         )
 
     if st.button("Process PDF", disabled=uploaded_file is None or docling_unavailable):
-        with st.spinner(f"Processing with {tool}..."):
+        with st.spinner(f"Processing with {tool}"):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             data = {"tool": tool}
             try:
