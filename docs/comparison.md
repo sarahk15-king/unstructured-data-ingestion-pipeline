@@ -13,7 +13,7 @@ List of tallest buildings, Periodic table).
 - Web scraping with BeautifulSoup was reliable across all 3 pages,
   though it picked up boilerplate tables/images alongside real content.
 
-**docling_vs_markitdown_vs_Open_Source_Lib.md:** see docling_vs_markitdown_vs_Open_Source_Lib.md for full detail.
+**Docling / MarkItDown:** see docling_vs_markitdown_vs_Open_Source_Lib.md for full detail
 Docling preserved structure and rendered simple tables cleanly;
 MarkItDown lost word spacing and mangled complex layouts/formulas.
 
