@@ -32,11 +32,13 @@ MarkItDown lost word spacing and mangled complex layouts/formulas.
 
 ## Performance (processing time per document)
 
-| PDF | Docling | MarkItDown |
-|---|---|---|
-| ACE (19p, table-heavy) | 195.0s | 1.6s |
-| graph-CNN (diagram-heavy) | 23.0s | 3.0s |
-| LSC (8p, moderate) | 44.6s | ~2s |
+| PDF | Docling | MarkItDown | pypdf (text) | pdfplumber (text + tables) |
+|---|---|---|---|---|
+| ACE (19p, table-heavy) | 195.0s | 1.6s | 0.5s | 2.3s |
+| graph-CNN (diagram-heavy) | 23.0s | 3.0s | 0.9s | 5.4s |
+| LSC (8p, moderate) | 44.6s | ~2s | 0.2s | 0.9s |
+
+The open-source libraries are the fastest because they only read the text layer. pypdf was quickest on all three PDFs. Docling is far slower because it runs layout detection and OCR models.
 
 ## Ease of use
 
