@@ -1,0 +1,4 @@
+# For running everything on your own computer, including Docling.
+# Install with: pip install -r requirements-local.txt
+-r requirements.txt
+docling
