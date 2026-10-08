@@ -210,7 +210,20 @@ def html_tables_to_markdown(text):
     return re.sub(r"<table\b.*?</table>", convert, text, flags=re.IGNORECASE | re.DOTALL)
 
 
-def azure_markdown(body, content_type=None):
+def clean_azure_markdown(text):
+    """Tidy Azure's Markdown: HTML tables become Markdown tables, figures keep only their caption
+    (not the chart's axis labels), and the page comments are removed."""
+    def figure(match):
+        caption = re.search(r"<figcaption>(.*?)</figcaption>", match.group(0), flags=re.IGNORECASE | re.DOTALL)
+        return " ".join(caption.group(1).split()) if caption else ""
+
+    text = re.sub(r"<figure\b.*?</figure>", figure, text, flags=re.IGNORECASE | re.DOTALL)
+    text = html_tables_to_markdown(text)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def azure_markdown(body, content_type=None, pages=None):
     """Markdown from Azure Document Intelligence (prebuilt-layout model).
 
     The free tier reads only the first two pages of a PDF and files up to 4 MB.
@@ -235,13 +248,41 @@ def azure_markdown(body, content_type=None):
 
     client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
     options = {"content_type": content_type} if content_type else {}
+    if pages:
+        options["pages"] = pages
     poller = client.begin_analyze_document("prebuilt-layout", body=body, output_content_format="markdown", **options)
-    return html_tables_to_markdown(poller.result().content)
+    return clean_azure_markdown(poller.result().content)
+
+
+AZURE_PAGES_PER_CALL = 2   # the free tier reads at most 2 pages per request
+AZURE_MAX_PAGES = 12       # keeps one upload from running too long on a free server
 
 
 def convert_with_azure(file_path):
-    with open(file_path, "rb") as f:
-        return azure_markdown(f)
+    """Send a PDF to Azure two pages at a time, so the free tier still covers the whole document."""
+    from pypdf import PdfReader
+
+    data = Path(file_path).read_bytes()
+    total_pages = len(PdfReader(str(file_path)).pages)
+    last_page = min(total_pages, AZURE_MAX_PAGES)
+
+    parts = []
+    for first in range(1, last_page + 1, AZURE_PAGES_PER_CALL):
+        last = min(first + AZURE_PAGES_PER_CALL - 1, last_page)
+        try:
+            parts.append(azure_markdown(data, content_type="application/pdf", pages=f"{first}-{last}"))
+        except HTTPException:
+            raise
+        except Exception as e:
+            if not parts:
+                raise
+            parts.append(f"> Azure stopped before page {first}: {e}")
+            break
+
+    markdown = "\n\n".join(parts)
+    if total_pages > AZURE_MAX_PAGES:
+        markdown += f"\n\n> Only the first {AZURE_MAX_PAGES} of {total_pages} pages were sent to Azure."
+    return markdown
 
 
 def convert_pdf(file_path, tool):
