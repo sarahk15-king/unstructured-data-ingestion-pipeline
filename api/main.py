@@ -285,12 +285,73 @@ def convert_with_azure(file_path):
     return markdown
 
 
+_docling_converter = None
+
+
+def light_docling_converter(DocumentConverter):
+    """Docling with its lighter settings: no OCR (the PDFs have a text layer) and the fast table model.
+
+    This uses less memory and time than the default setup. If these settings are not available in the
+    installed Docling version, the default converter is used instead.
+    """
+    global _docling_converter
+    if _docling_converter is None:
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+            from docling.document_converter import PdfFormatOption
+
+            options = PdfPipelineOptions()
+            options.do_ocr = False
+            options.table_structure_options.mode = TableFormerMode.FAST
+            _docling_converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+            )
+        except Exception:
+            _docling_converter = DocumentConverter()
+    return _docling_converter
+
+
+def convert_with_docling(file_path):
+    """Docling needs more memory than Render's free tier has.
+
+    When DOCLING_SERVICE_URL is set, the PDF is sent to a separate Docling service (for example a
+    Hugging Face Space). Otherwise Docling runs inside this server, which works on a local machine.
+    """
+    service_url = os.getenv("DOCLING_SERVICE_URL")
+    if service_url:
+        headers = {"X-Token": os.getenv("DOCLING_SERVICE_TOKEN", "")}
+        with open(file_path, "rb") as f:
+            try:
+                response = requests.post(
+                    service_url.rstrip("/") + "/convert",
+                    files={"file": ("document.pdf", f, "application/pdf")},
+                    headers=headers,
+                    timeout=900,
+                )
+            except requests.RequestException as e:
+                raise HTTPException(status_code=502, detail=f"Could not reach the Docling service: {e}")
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("detail", response.text[:200])
+            except ValueError:
+                detail = response.text[:200]
+            raise HTTPException(status_code=502, detail=f"Docling service error ({response.status_code}): {detail}")
+        return response.json()["markdown"]
+
+    try:
+        from docling.document_converter import DocumentConverter
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="Docling is not set up on this server. Set DOCLING_SERVICE_URL, or run the backend locally.",
+        )
+    return light_docling_converter(DocumentConverter).convert(str(file_path)).document.export_to_markdown()
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
-        from docling.document_converter import DocumentConverter
-        converter = DocumentConverter()
-        result = converter.convert(str(file_path))
-        return result.document.export_to_markdown()
+        return convert_with_docling(file_path)
     elif tool == "markitdown":
         from markitdown import MarkItDown
         converter = MarkItDown()
