@@ -129,6 +129,40 @@ def put_tables_in_text(text, tables):
     return result
 
 
+def fix_markdown_tables(markdown_text, tables):
+    """Replace tables that MarkItDown got wrong with the tables found by pdfplumber.
+
+    MarkItDown sometimes merges columns ("Quarter North") or leaves a table as loose lines. For each
+    pdfplumber table, find the run of lines whose words match the table's words, in order, and put a
+    clean Markdown table there.
+    """
+    def words(text):
+        return re.sub(r"[|]|(?<!\w)-{3,}(?!\w)", " ", text).split()
+
+    lines = markdown_text.split("\n")
+    for rows in tables:
+        target = [w for row in rows for cell in row for w in (cell or "").split()]
+        if not target:
+            continue
+        found = None
+        for start in range(len(lines)):
+            if not words(lines[start]) or words(lines[start])[0] != target[0]:
+                continue
+            got = []
+            for end in range(start, min(len(lines), start + len(rows) * 3 + 6)):
+                got += words(lines[end])
+                if got == target:
+                    found = (start, end + 1)
+                    break
+                if len(got) >= len(target) or got != target[:len(got)]:
+                    break
+            if found:
+                break
+        if found:
+            lines[found[0]:found[1]] = ["", rows_to_markdown(rows), ""]
+    return "\n".join(lines)
+
+
 def convert_with_pypdf(file_path):
     """Text from pypdf, one section per page. pdfplumber only finds the tables, which are shown as Markdown tables."""
     import pdfplumber
@@ -744,6 +778,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     table_summaries = []
     image_keys = []
     image_places = []
+    table_rows = []
     warnings = []
     table_meta = {"source": "api-upload", "document": doc_name, "date": today}
 
@@ -763,6 +798,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 name = f"page{page_num}_table{kept}"
                 key = f"processed/extracted/pdf/{doc_name}/tables/{name}.csv"
                 table_summaries.append(upload_table(key, name, rows, table_meta))
+                table_rows.append(rows)
 
             # Images: figures (including vector drawings) first, then embedded pictures
             if len(image_keys) >= MAX_IMAGES:
@@ -838,6 +874,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
         "image_keys": image_keys,
     }
     parts["image_places"] = image_places
+    parts["table_rows"] = table_rows
     return parts, table_summaries, warnings
 
 
@@ -869,9 +906,11 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
     warnings = []
     image_keys = []
     image_places = []
+    table_rows = []
     try:
         parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
         image_places = parts.pop("image_places", [])
+        table_rows = parts.pop("table_rows", [])
         uploaded.update(parts)
         image_keys = parts["image_keys"]
     except Exception as e:
@@ -884,6 +923,8 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
+    if tool == "markitdown":
+        converted = fix_markdown_tables(converted, table_rows)
     markdown_text = place_images(converted, image_places)
     markdown_key = upload_result(doc_name, tool, markdown_text)
     uploaded["markdown"] = markdown_key
