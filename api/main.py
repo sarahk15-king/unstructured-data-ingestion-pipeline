@@ -92,30 +92,75 @@ def rows_to_markdown(rows):
     return "\n".join(lines)
 
 
+def put_tables_in_text(text, tables):
+    """Swap each table's loose text lines for a Markdown table.
+
+    pypdf and pdfplumber give a table as plain lines (one cell or one row per line). For each
+    table, find that run of lines in the page text and replace it with a Markdown table. If the
+    run cannot be found, the table is added at the end of the page instead.
+    """
+    lines = text.split("\n")
+    leftover = []
+    for rows in tables:
+        known = set()
+        for row in rows:
+            cells = [(cell or "").replace("\n", " ").strip() for cell in row]
+            known.update(c for c in cells if c)
+            known.add(" ".join(c for c in cells if c))
+        best = None  # (start, end) of the longest run of lines that belong to the table
+        start = None
+        for n, line in enumerate(lines + [None]):
+            if line is not None and line.strip() in known:
+                if start is None:
+                    start = n
+            elif start is not None:
+                if best is None or n - start > best[1] - best[0]:
+                    best = (start, n)
+                start = None
+        cell_count = sum(1 for row in rows for cell in row if (cell or "").strip())
+        if best and (best[1] - best[0]) >= max(2, len(rows)):
+            lines[best[0]:best[1]] = ["", rows_to_markdown(rows), ""]
+        else:
+            leftover.append(rows)
+    result = "\n".join(lines)
+    for rows in leftover:
+        result += "\n\n" + rows_to_markdown(rows)
+    return result
+
+
 def convert_with_pypdf(file_path):
-    """Plain text from pypdf, one section per page."""
+    """Text from pypdf, one section per page. pdfplumber only finds the tables, which are shown as Markdown tables."""
+    import pdfplumber
     from pypdf import PdfReader
 
+    reader = PdfReader(str(file_path))
     parts = []
-    for page_num, page in enumerate(PdfReader(str(file_path)).pages, start=1):
-        parts.append(f"## Page {page_num}\n\n{(page.extract_text() or '').strip()}")
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page_num, (page, plumber_page) in enumerate(zip(reader.pages, pdf.pages), start=1):
+            text = (page.extract_text() or "").strip()
+            try:
+                tables = extract_page_tables(plumber_page, find_figure_regions(plumber_page))
+                text = put_tables_in_text(text, tables)
+            except Exception:
+                pass  # keep the page text even if table detection fails
+            parts.append(f"## Page {page_num}\n\n{text}")
     return "\n\n".join(parts)
 
 
 def convert_with_pdfplumber(file_path):
-    """Text from pdfplumber, with the real tables on each page added as Markdown tables."""
+    """Text from pdfplumber, with each table shown as a Markdown table."""
     import pdfplumber
 
     parts = []
     with pdfplumber.open(str(file_path)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            section = [f"## Page {page_num}", (page.extract_text() or "").strip()]
+            text = (page.extract_text() or "").strip()
             try:
-                for rows in extract_page_tables(page, find_figure_regions(page)):
-                    section.append(rows_to_markdown(rows))
+                tables = extract_page_tables(page, find_figure_regions(page))
+                text = put_tables_in_text(text, tables)
             except Exception:
                 pass  # keep the page text even if table detection fails
-            parts.append("\n\n".join(section))
+            parts.append(f"## Page {page_num}\n\n{text}")
     return "\n\n".join(parts)
 
 
