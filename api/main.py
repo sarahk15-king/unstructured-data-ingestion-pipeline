@@ -80,6 +80,45 @@ def upload_table(key, name, rows, metadata):
     }
 
 
+PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber")
+
+
+def rows_to_markdown(rows):
+    """Turn a list of table rows into a Markdown table."""
+    width = max(len(row) for row in rows)
+    padded = [[(cell or "").replace("|", "/").replace("\n", " ") for cell in row] + [""] * (width - len(row)) for row in rows]
+    lines = ["| " + " | ".join(padded[0]) + " |", "|" + " --- |" * width]
+    lines += ["| " + " | ".join(row) + " |" for row in padded[1:]]
+    return "\n".join(lines)
+
+
+def convert_with_pypdf(file_path):
+    """Plain text from pypdf, one section per page."""
+    from pypdf import PdfReader
+
+    parts = []
+    for page_num, page in enumerate(PdfReader(str(file_path)).pages, start=1):
+        parts.append(f"## Page {page_num}\n\n{(page.extract_text() or '').strip()}")
+    return "\n\n".join(parts)
+
+
+def convert_with_pdfplumber(file_path):
+    """Text from pdfplumber, with the real tables on each page added as Markdown tables."""
+    import pdfplumber
+
+    parts = []
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            section = [f"## Page {page_num}", (page.extract_text() or "").strip()]
+            try:
+                for rows in extract_page_tables(page, find_figure_regions(page)):
+                    section.append(rows_to_markdown(rows))
+            except Exception:
+                pass  # keep the page text even if table detection fails
+            parts.append("\n\n".join(section))
+    return "\n\n".join(parts)
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         from docling.document_converter import DocumentConverter
@@ -91,8 +130,12 @@ def convert_pdf(file_path, tool):
         converter = MarkItDown()
         result = converter.convert(str(file_path))
         return result.text_content
+    elif tool == "pypdf":
+        return convert_with_pypdf(file_path)
+    elif tool == "pdfplumber":
+        return convert_with_pdfplumber(file_path)
     else:
-        raise ValueError("tool must be 'docling' or 'markitdown'")
+        raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
 
 def add_image_links(markdown_text, image_keys):
@@ -483,8 +526,8 @@ def root():
 
 @app.post("/process-pdf")
 def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
-    if tool not in ("docling", "markitdown"):
-        raise HTTPException(status_code=400, detail="tool must be 'docling' or 'markitdown'")
+    if tool not in PDF_TOOLS:
+        raise HTTPException(status_code=400, detail="tool must be one of: " + ", ".join(PDF_TOOLS))
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         shutil.copyfileobj(file.file, tmp)
