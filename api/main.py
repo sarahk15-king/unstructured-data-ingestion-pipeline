@@ -165,6 +165,51 @@ def convert_with_pdfplumber(file_path):
     return "\n\n".join(parts)
 
 
+def html_tables_to_markdown(text):
+    """Azure writes tables as HTML. Turn each <table> into a Markdown table (the caption goes above it)."""
+    if "<table" not in text.lower():
+        return text
+
+    def convert(match):
+        soup = BeautifulSoup(match.group(0), "lxml")
+        table = soup.find("table")
+        rows = []
+        spans = {}  # column -> (cell text, rows still to fill) for cells that span several rows
+        for tr in table.find_all("tr"):
+            row, col = [], 0
+            cells = tr.find_all(["th", "td"])
+            cell_iter = iter(cells)
+            while True:
+                if col in spans:
+                    value, left = spans[col]
+                    row.append(value)
+                    spans[col] = (value, left - 1) if left > 1 else None
+                    if spans[col] is None:
+                        del spans[col]
+                    col += 1
+                    continue
+                cell = next(cell_iter, None)
+                if cell is None:
+                    break
+                value = " ".join(cell.get_text(" ", strip=True).split())
+                colspan = int(cell.get("colspan", 1) or 1)
+                rowspan = int(cell.get("rowspan", 1) or 1)
+                for _ in range(colspan):
+                    row.append(value)
+                    if rowspan > 1:
+                        spans[col] = (value, rowspan - 1)
+                    col += 1
+            if row:
+                rows.append(row)
+        if not rows:
+            return match.group(0)
+        caption = table.find("caption")
+        title = f"{caption.get_text(' ', strip=True)}\n\n" if caption else ""
+        return title + rows_to_markdown(rows)
+
+    return re.sub(r"<table\b.*?</table>", convert, text, flags=re.IGNORECASE | re.DOTALL)
+
+
 def azure_markdown(body, content_type=None):
     """Markdown from Azure Document Intelligence (prebuilt-layout model).
 
@@ -178,13 +223,20 @@ def azure_markdown(body, content_type=None):
             detail="Azure is not set up on this server. Add AZURE_DOCINTEL_ENDPOINT and AZURE_DOCINTEL_KEY.",
         )
 
-    from azure.ai.documentintelligence import DocumentIntelligenceClient
-    from azure.core.credentials import AzureKeyCredential
+    try:
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.core.credentials import AzureKeyCredential
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="The Azure library is not installed on this server. Add azure-ai-documentintelligence "
+                   "to requirements.txt and redeploy.",
+        )
 
     client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
     options = {"content_type": content_type} if content_type else {}
     poller = client.begin_analyze_document("prebuilt-layout", body=body, output_content_format="markdown", **options)
-    return poller.result().content
+    return html_tables_to_markdown(poller.result().content)
 
 
 def convert_with_azure(file_path):
