@@ -80,7 +80,8 @@ def upload_table(key, name, rows, metadata):
     }
 
 
-PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber")
+PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber", "azure")
+URL_TOOLS = ("beautifulsoup", "azure", "pypdf", "pdfplumber")
 
 
 def rows_to_markdown(rows):
@@ -164,6 +165,33 @@ def convert_with_pdfplumber(file_path):
     return "\n\n".join(parts)
 
 
+def azure_markdown(body, content_type=None):
+    """Markdown from Azure Document Intelligence (prebuilt-layout model).
+
+    The free tier reads only the first two pages of a PDF and files up to 4 MB.
+    """
+    endpoint = os.getenv("AZURE_DOCINTEL_ENDPOINT")
+    key = os.getenv("AZURE_DOCINTEL_KEY")
+    if not endpoint or not key:
+        raise HTTPException(
+            status_code=503,
+            detail="Azure is not set up on this server. Add AZURE_DOCINTEL_ENDPOINT and AZURE_DOCINTEL_KEY.",
+        )
+
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.credentials import AzureKeyCredential
+
+    client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+    options = {"content_type": content_type} if content_type else {}
+    poller = client.begin_analyze_document("prebuilt-layout", body=body, output_content_format="markdown", **options)
+    return poller.result().content
+
+
+def convert_with_azure(file_path):
+    with open(file_path, "rb") as f:
+        return azure_markdown(f)
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         from docling.document_converter import DocumentConverter
@@ -179,6 +207,8 @@ def convert_pdf(file_path, tool):
         return convert_with_pypdf(file_path)
     elif tool == "pdfplumber":
         return convert_with_pdfplumber(file_path)
+    elif tool == "azure":
+        return convert_with_azure(file_path)
     else:
         raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
@@ -569,6 +599,61 @@ def root():
     return {"status": "ok", "message": "Ingestion pipeline API is running"}
 
 
+def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
+    """Upload a PDF, extract its parts and convert it to Markdown. Used for uploads and PDF links."""
+    doc_name = safe_name(Path(filename).stem)
+    today = date.today().isoformat()
+
+    # 1. Original PDF
+    original_key = f"raw/pdf/api-uploads/{today}/{doc_name}.pdf"
+    s3.upload_file(
+        str(tmp_path),
+        BUCKET,
+        original_key,
+        ExtraArgs={
+            "ContentType": "application/pdf",
+            "Metadata": {"source": "api-upload", "document": doc_name, "date": today, "type": "pdf"},
+        },
+    )
+
+    # 2. Text, tables and images as separate files
+    uploaded = {"original_pdf": original_key}
+    table_summaries = []
+    warnings = []
+    image_keys = []
+    try:
+        parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
+        uploaded.update(parts)
+        image_keys = parts["image_keys"]
+    except Exception as e:
+        warnings.append(f"Text, table and image extraction failed: {e}")
+
+    # 3. Whole document as Markdown, with links to the images saved in S3
+    try:
+        converted = convert_pdf(tmp_path, tool)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
+    markdown_text = add_image_links(converted, image_keys)
+    markdown_key = upload_result(doc_name, tool, markdown_text)
+    uploaded["markdown"] = markdown_key
+
+    return {
+        **(extra or {}),
+        "filename": filename,
+        "tool": tool,
+        "s3_key": markdown_key,
+        "s3_url": f"s3://{BUCKET}/{markdown_key}",
+        "markdown_preview": markdown_text[:1000],
+        "markdown_text": markdown_text,
+        "markdown_length": len(markdown_text),
+        "uploaded": uploaded,
+        "tables": table_summaries,
+        "warnings": warnings,
+    }
+
+
 @app.post("/process-pdf")
 def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
     if tool not in PDF_TOOLS:
@@ -577,65 +662,50 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
-
     try:
-        doc_name = safe_name(Path(file.filename).stem)
-        today = date.today().isoformat()
-
-        # 1. Original PDF
-        original_key = f"raw/pdf/api-uploads/{today}/{doc_name}.pdf"
-        s3.upload_file(
-            str(tmp_path),
-            BUCKET,
-            original_key,
-            ExtraArgs={
-                "ContentType": "application/pdf",
-                "Metadata": {"source": "api-upload", "document": doc_name, "date": today, "type": "pdf"},
-            },
-        )
-
-        # 2. Text, tables and images as separate files
-        uploaded = {"original_pdf": original_key}
-        table_summaries = []
-        warnings = []
-        image_keys = []
-        try:
-            parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
-            uploaded.update(parts)
-            image_keys = parts["image_keys"]
-        except Exception as e:
-            warnings.append(f"Text, table and image extraction failed: {e}")
-
-        # 3. Whole document as Markdown, with links to the images saved in S3
-        markdown_text = add_image_links(convert_pdf(tmp_path, tool), image_keys)
-        markdown_key = upload_result(doc_name, tool, markdown_text)
-        uploaded["markdown"] = markdown_key
-
-        return {
-            "filename": file.filename,
-            "tool": tool,
-            "s3_key": markdown_key,
-            "s3_url": f"s3://{BUCKET}/{markdown_key}",
-            "markdown_preview": markdown_text[:1000],
-            "markdown_text": markdown_text,
-            "markdown_length": len(markdown_text),
-            "uploaded": uploaded,
-            "tables": table_summaries,
-            "warnings": warnings,
-        }
+        return run_pdf_pipeline(tmp_path, file.filename, tool)
     finally:
         tmp_path.unlink(missing_ok=True)
 
 
 @app.post("/process-url")
-def process_url(url: str = Form(...)):
+def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
+    if tool not in URL_TOOLS:
+        raise HTTPException(status_code=400, detail="tool must be one of: " + ", ".join(URL_TOOLS))
     today = date.today().isoformat()
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        response = requests.get(url, headers=HEADERS, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Could not fetch the URL: {e}")
+
+    # A link to a PDF file goes through the PDF pipeline with the chosen tool
+    is_pdf = (
+        "pdf" in response.headers.get("Content-Type", "").lower()
+        or urlparse(url).path.lower().endswith(".pdf")
+        or response.content[:5] == b"%PDF-"
+    )
+    if is_pdf:
+        if tool == "beautifulsoup":
+            raise HTTPException(
+                status_code=400,
+                detail="This link is a PDF. BeautifulSoup reads web pages, so choose Azure, pypdf or pdfplumber.",
+            )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(response.content)
+            tmp_path = Path(tmp.name)
+        try:
+            file_name = Path(urlparse(url).path).name or "document.pdf"
+            return run_pdf_pipeline(tmp_path, file_name, tool, extra={"url": url})
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    if tool in ("pypdf", "pdfplumber"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{tool} reads PDF files, and this link is a web page. Choose BeautifulSoup or Azure, or use a link to a PDF.",
+        )
 
     soup = BeautifulSoup(response.text, "lxml")
     doc_name = safe_name(urlparse(url).path) if urlparse(url).path.strip("/") else "page"
@@ -654,7 +724,16 @@ def process_url(url: str = Form(...)):
 
     meta = {"source": "api-upload-url", "document": doc_name, "date": today}
 
-    markdown_key = f"processed/markdown/web/api-uploads/{doc_name}.md"
+    if tool == "azure":
+        try:
+            markdown_text = azure_markdown(response.content, content_type="text/html")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"azure could not convert this page: {e}")
+        markdown_key = f"processed/markdown/azure/web/{doc_name}.md"
+    else:
+        markdown_key = f"processed/markdown/web/api-uploads/{doc_name}.md"
     text_key = put_json(f"raw/web/{doc_name}/{today}/text.json", text_elements, {**meta, "type": "text"})
 
     # Tables: each one becomes its own CSV file
@@ -708,6 +787,7 @@ def process_url(url: str = Form(...)):
 
     return {
         "url": url,
+        "tool": tool,
         "s3_key": markdown_key,
         "s3_url": f"s3://{BUCKET}/{markdown_key}",
         "markdown_preview": markdown_text[:1000],
