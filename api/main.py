@@ -367,16 +367,102 @@ def convert_pdf(file_path, tool):
         raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
 
+def image_link(key):
+    name = key.rsplit("/", 1)[-1]
+    return f"![{name}](s3://{BUCKET}/{key})"
+
+
 def add_image_links(markdown_text, image_keys):
-    """Append links to the images saved in S3 so the Markdown points to where they are stored."""
+    """Append links for images that could not be placed next to their figure, at the end of the Markdown."""
     if not image_keys:
         return markdown_text
     lines = ["", "## Extracted images", ""]
     for key in image_keys:
-        name = key.rsplit("/", 1)[-1]
-        lines.append(f"![{name}](s3://{BUCKET}/{key})")
+        lines.append(image_link(key))
         lines.append("")
     return markdown_text.rstrip() + "\n" + "\n".join(lines)
+
+
+def place_images(markdown_text, places):
+    """Put each image link where its figure is in the Markdown.
+
+    A figure is found by its "Figure N:" caption and its images go just above it, where the picture
+    sits on the page. A picture without a caption goes at the end of its page when the Markdown has
+    "## Page N" sections. Anything that cannot be placed is listed at the end.
+    """
+    if not places:
+        return markdown_text
+
+    page_marks = [(int(m.group(1)), m.start()) for m in re.finditer(r"(?m)^## Page (\d+)\s*$", markdown_text)]
+
+    def page_span(page):
+        for n, (number, start) in enumerate(page_marks):
+            if number == page:
+                end = page_marks[n + 1][1] if n + 1 < len(page_marks) else len(markdown_text)
+                return start, end
+        return None
+
+    groups = {}  # figure label -> {"page": ..., "keys": [...]}
+    loose = []   # images without a caption
+    for place in places:
+        if place.get("label"):
+            group = groups.setdefault(place["label"], {"page": place["page"], "keys": []})
+            group["keys"].append(place["key"])
+        else:
+            loose.append(place)
+
+    inserts = []  # (position, text)
+    unplaced = []
+
+    for label, group in groups.items():
+        number = label.split()[-1]
+        pattern = re.compile(r"(?m)^[ \t>*_#]{0,6}(?:Figure|Fig\.)[ \t]*" + number + r"[ \t]*[:.]")
+        span = page_span(group["page"])
+        match = pattern.search(markdown_text, span[0], span[1]) if span else pattern.search(markdown_text)
+        block = "\n\n".join(image_link(k) for k in group["keys"])
+        if match:
+            inserts.append((match.start(), block + "\n\n"))
+        elif span:
+            inserts.append((span[1], "\n\n" + block + "\n\n"))
+        else:
+            unplaced.extend(group["keys"])
+
+    by_page = {}
+    for place in loose:
+        by_page.setdefault(place["page"], []).append(place["key"])
+    for page, keys in by_page.items():
+        span = page_span(page)
+        if span:
+            inserts.append((span[1], "\n\n" + "\n\n".join(image_link(k) for k in keys) + "\n\n"))
+        else:
+            unplaced.extend(keys)
+
+    for position, text in sorted(inserts, key=lambda item: item[0], reverse=True):
+        markdown_text = markdown_text[:position] + text + markdown_text[position:]
+    markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text)
+    return add_image_links(markdown_text, unplaced)
+
+
+def figure_label(page, box):
+    """The label of the figure in this box ("Figure 2"), from the caption just below it."""
+    best = None
+    pattern = re.compile(r"^(?:Figure|Fig\.)\s*(\d+)\s*[:.]", re.IGNORECASE)
+    candidates = [(line["x0"], line["x1"], line["top"], line["text"].strip()) for line in page.extract_text_lines()]
+    words = page.extract_words()
+    for i, w in enumerate(words):
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        text = w["text"]
+        if nxt is not None and abs(nxt["top"] - w["top"]) < 3 and re.fullmatch(r"(Figure|Fig\.)", text, re.IGNORECASE):
+            text += nxt["text"]
+        candidates.append((w["x0"], w["x1"], w["top"], text))
+    for x0, x1, top, text in candidates:
+        found = pattern.match(text)
+        if not found or x1 < box[0] - 5 or x0 > box[2] + 5:
+            continue
+        distance = top - box[3]
+        if -10 <= distance <= 90 and (best is None or distance < best[0]):
+            best = (distance, f"Figure {found.group(1)}")
+    return best[1] if best else None
 
 
 def upload_result(doc_name, tool, markdown_text):
@@ -657,6 +743,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     pages_text = []
     table_summaries = []
     image_keys = []
+    image_places = []
     warnings = []
     table_meta = {"source": "api-upload", "document": doc_name, "date": today}
 
@@ -697,11 +784,15 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
 
             to_save = []
             for i, box in enumerate(figures):
-                to_save.append((f"page{page_num}_figure{i}", box))
+                try:
+                    label = figure_label(page, box)
+                except Exception:
+                    label = None
+                to_save.append((f"page{page_num}_figure{i}", box, label))
                 # Also save each labelled panel (a), (b), (c) as its own image
                 for letter, panel_box in split_panels(page, box):
-                    to_save.append((f"page{page_num}_figure{i}_{letter}", panel_box))
-            to_save += pictures
+                    to_save.append((f"page{page_num}_figure{i}_{letter}", panel_box, label))
+            to_save += [(name, box, None) for name, box in pictures]
             if not to_save:
                 continue
 
@@ -711,7 +802,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 warnings.append(f"Could not render page {page_num} to save its images: {e}")
                 continue
             scale = RENDER_DPI / 72
-            for name, box in to_save:
+            for name, box, label in to_save:
                 if len(image_keys) >= MAX_IMAGES:
                     break
                 try:
@@ -729,6 +820,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                         {"source": "api-upload", "document": doc_name, "date": today, "type": "image"},
                     )
                     image_keys.append(key)
+                    image_places.append({"key": key, "page": page_num, "label": label})
                 except Exception as e:
                     warnings.append(f"Skipped {name}: {e}")
 
@@ -745,6 +837,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
         "image_count": len(image_keys),
         "image_keys": image_keys,
     }
+    parts["image_places"] = image_places
     return parts, table_summaries, warnings
 
 
@@ -775,8 +868,10 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
     table_summaries = []
     warnings = []
     image_keys = []
+    image_places = []
     try:
         parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
+        image_places = parts.pop("image_places", [])
         uploaded.update(parts)
         image_keys = parts["image_keys"]
     except Exception as e:
@@ -789,7 +884,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
-    markdown_text = add_image_links(converted, image_keys)
+    markdown_text = place_images(converted, image_places)
     markdown_key = upload_result(doc_name, tool, markdown_text)
     uploaded["markdown"] = markdown_key
 
