@@ -4,8 +4,10 @@ import streamlit as st
 
 API_URL = "https://ingestion-pipeline-api.onrender.com"
 
-# Docling needs more memory than Render's free tier has, so it only works against a local backend.
+# Docling needs more memory than Render's free tier has, so it is only offered with a local backend.
 DOCLING_AVAILABLE = "localhost" in API_URL or "127.0.0.1" in API_URL
+
+TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "docling": "Docling"}
 
 st.set_page_config(page_title="Unstructured Data Ingestion Pipeline", layout="wide")
 st.title("Unstructured Data Ingestion Pipeline")
@@ -59,17 +61,11 @@ tab1, tab2 = st.tabs(["Upload PDF", "Submit URL"])
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
-    tool = st.selectbox("Conversion tool", ["markitdown", "docling"])
+    tool_options = ["markitdown", "pypdf", "pdfplumber"] + (["docling"] if DOCLING_AVAILABLE else [])
+    tool = st.selectbox("Conversion tool", tool_options)
 
-    docling_unavailable = tool == "docling" and not DOCLING_AVAILABLE
-    if docling_unavailable:
-        st.warning(
-            "Docling is currently unavailable on this deployed app because the Render free tier "
-            "does not have enough memory to run it. Please use MarkItDown."
-        )
-
-    if st.button("Process PDF", disabled=uploaded_file is None or docling_unavailable):
-        with st.spinner(f"Processing with {'MarkItDown' if tool == 'markitdown' else 'Docling'}..."):
+    if st.button("Process PDF", disabled=uploaded_file is None):
+        with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             data = {"tool": tool}
             try:
