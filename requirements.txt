@@ -3,10 +3,9 @@ uvicorn
 python-multipart
 boto3
 python-dotenv
-docling
 markitdown[pdf]
 pdfplumber
+pypdf
 requests
 beautifulsoup4
 lxml
-pypdf
