@@ -9,3 +9,4 @@ pypdf
 requests
 beautifulsoup4
 lxml
+azure-ai-documentintelligence
