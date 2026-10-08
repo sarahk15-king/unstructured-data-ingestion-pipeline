@@ -1,11 +1,19 @@
+import os
+
 import pandas as pd
 import requests
 import streamlit as st
 
-API_URL = "https://ingestion-pipeline-api.onrender.com"
+# The backend. It defaults to the deployed Render service. To run everything on your own computer,
+# set the API_URL environment variable to http://localhost:8000 before starting the app.
+API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
+
+# Optional: a separate backend used only for Docling, for example a local backend shared
+# through a tunnel. Leave it unset to use API_URL for everything.
+DOCLING_API_URL = os.getenv("DOCLING_API_URL", "")
 
 # Docling needs more memory than Render's free tier has, so it only works against a local backend.
-DOCLING_AVAILABLE = "localhost" in API_URL or "127.0.0.1" in API_URL
+DOCLING_AVAILABLE = bool(DOCLING_API_URL) or "localhost" in API_URL or "127.0.0.1" in API_URL
 
 TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "docling": "Docling"}
 
@@ -67,7 +75,8 @@ with tab1:
     if docling_unavailable:
         st.warning(
             "Docling is currently unavailable on this deployed app because the Render free tier "
-            "does not have enough memory to run it. Please use MarkItDown, pypdf or pdfplumber."
+            "does not have enough memory to run it. To use it, run the backend and the app on your own "
+            "computer (see the README), or pick MarkItDown, pypdf or pdfplumber."
         )
 
     if st.button("Process PDF", disabled=uploaded_file is None or docling_unavailable):
@@ -75,7 +84,8 @@ with tab1:
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             data = {"tool": tool}
             try:
-                response = requests.post(f"{API_URL}/process-pdf", files=files, data=data, timeout=300)
+                backend = DOCLING_API_URL if tool == "docling" and DOCLING_API_URL else API_URL
+                response = requests.post(f"{backend.rstrip('/')}/process-pdf", files=files, data=data, timeout=600)
                 response.raise_for_status()
                 st.session_state["pdf_result"] = response.json()
             except Exception as e:
