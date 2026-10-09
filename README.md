@@ -14,7 +14,7 @@ A pipeline that converts unstructured documents (PDFs and web pages) into clean 
 
    | Tool | PDF tab | URL tab | Notes |
    |---|---|---|---|
-   | MarkItDown | yes | | Fast, runs on Render |
+   | MarkItDown | yes | yes | Fast, runs on Render |
    | pypdf | yes | PDF links | Text only; tables come from pdfplumber |
    | pdfplumber | yes | PDF links | Text and tables |
    | Azure Document Intelligence | yes | yes | Needs Azure keys; free tier reads 2 pages per request, so the backend sends the PDF in 2-page chunks (up to 12 pages) |
