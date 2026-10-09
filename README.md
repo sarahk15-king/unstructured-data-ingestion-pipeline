@@ -95,3 +95,111 @@ venv\Scripts\activate          # Windows
 source venv/bin/activate       # macOS / Linux
 pip install -r requirements.txt
 ```
+
+To use Docling in the app, install the local requirements instead (they add `docling`):
+
+```
+pip install -r requirements-local.txt
+```
+
+### 3. Set environment variables
+
+Create a `.env` file in the project root. Never commit it.
+
+```
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=...
+S3_BUCKET=...
+```
+
+Only for Azure (the app's Azure option and the Azure scripts):
+
+```
+AZURE_DOCINTEL_ENDPOINT=...
+AZURE_DOCINTEL_KEY=...
+```
+
+### 4. Run it locally
+
+Backend:
+
+```
+uvicorn api.main:app --reload
+```
+
+Frontend, in a second terminal:
+
+```
+streamlit run app.py
+```
+
+To use the app against your local backend, set `API_URL` to `http://localhost:8000` (`API_URL=http://localhost:8000 streamlit run app.py`). Docling is only available when the backend runs locally.
+
+### 5. Run the individual tasks (optional)
+
+```
+python extract_pdf.py
+python extract_web.py
+python extract_azure.py
+python extract_azure_web.py
+python extract_textract.py
+python convert_markdown.py
+python upload_to_s3.py
+```
+
+## Deploying
+
+### Backend on Render
+
+1. Push the repo to GitHub. Never commit `.env` or any keys.
+2. In Render, create a new **Web Service** and connect the GitHub repo.
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
+5. Under **Environment**, add `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `S3_BUCKET`. To use the Azure option, also add `AZURE_DOCINTEL_ENDPOINT` and `AZURE_DOCINTEL_KEY`.
+6. Deploy and wait until the service shows **Live**. Open the service URL to check that it returns `{"status": "ok"}`.
+
+### Frontend on Streamlit Community Cloud
+
+1. Set `API_URL` in `app.py` to your Render URL and push the change.
+2. At share.streamlit.io, create a new app from the GitHub repo with `app.py` as the main file.
+3. Deploy. Streamlit redeploys automatically on every push to GitHub.
+
+### Updating a deployed app
+
+Commit the change to GitHub. Render and Streamlit both redeploy on their own.
+
+## Tool comparison summary
+
+Three approaches were tested on PDF and web extraction:
+
+- **Open-source (pypdf, pdfplumber, BeautifulSoup):** free and light, and the fastest, but they return plain text and need custom code for structure, tables and figures. pdfplumber missed all tables in one PDF and hit a limit on another.
+- **Docling / MarkItDown:** Docling preserved structure and tables faithfully but was slow (195s on a 19-page table-heavy PDF). MarkItDown was near-instant but lost word spacing and mangled tables and formulas on complex documents.
+- **Enterprise (Azure Document Intelligence, AWS Textract):** Azure's free tier handled text cleanly but found zero tables and hit file-size limits. It analyzes only the first two pages of each document on the free tier. AWS Textract could not be tested because it requires upgrading the AWS free plan to a paid plan.
+
+**Recommendation:** Docling for dense, multimodal PDFs; MarkItDown as a fast fallback for simple text documents. Full write-ups are in `docs/comparison.md` and `docs/docling_vs_markitdown_vs_Open_Source_Lib.md`.
+
+## S3 storage layout
+
+```
+raw/pdf/<source>/<date>/<file>.pdf
+raw/web/<document>/<date>/text.json
+raw/web/<document>/<date>/tables/table_<n>.csv
+processed/markdown/<tool>/<source>/<file>.md
+processed/extracted/pdf/<document>/text.json
+processed/extracted/pdf/<document>/tables/page<p>_table<n>.csv
+assets/images/<source>/<document>/<image>.png
+```
+
+Every object carries metadata tags (source, tool, date, type, document name) so files can be filtered without parsing key paths. The bucket is private, blocks public access and uses SSE-S3 encryption. Full detail in `docs/s3_storage_layout.md`.
+
+## Known limitations
+
+- **Docling works only locally.** Docling is an open-source tool that loads heavy AI models. Render's free tier has 512 MB of memory, so it runs out of memory there and returns a 502 error. To use Docling, run the project on your own computer: install `requirements-local.txt`, start the backend with `uvicorn api.main:app --reload`, and run the app with `API_URL=http://localhost:8000 streamlit run app.py`. The other five tools work on the live app.
+- Azure's free tier reads only 2 pages per request, so the backend sends the PDF in 2-page chunks and stops at 12 pages.
+- The image links in the Markdown are `s3://` links to the private bucket, so a Markdown viewer will not show them as pictures. Pictures without a "Figure N" caption are placed at the end of their page for pypdf and pdfplumber, and at the end of the file for the other tools. Images from web pages are listed at the end.
+- Complex tables with merged cells may not become clean Markdown tables.
+
+## Tech stack
+
+FastAPI, Streamlit, boto3 (AWS S3), Docling, MarkItDown, pdfplumber, pypdf, BeautifulSoup, Azure AI Document Intelligence, AWS Textract. Backend deployed on Render, frontend on Streamlit Community Cloud.
