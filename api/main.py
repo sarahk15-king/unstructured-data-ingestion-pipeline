@@ -162,23 +162,169 @@ def fix_markdown_tables(markdown_text, tables):
     return re.sub(r"\n{3,}", "\n\n", markdown_text)
 
 
+def page_margin_texts(page, words, repeated):
+    """Header lines and footer lines of one page, as plain text (the same rules the column reader uses)."""
+    if not words:
+        return [], []
+    body_size = Counter(round(w["size"]) for w in words).most_common(1)[0][0]
+    footer_ids = footer_word_ids(page, words, body_size, repeated)
+    margin = page.height * 0.11
+    header_words = []
+    for line in group_lines([w for w in words if w["bottom"] < margin and id(w) not in footer_ids]):
+        text = line_text(line)
+        if re.fullmatch(r"(page\s+)?\d{1,4}", text, re.I) or _in_drop(page, line[0], repeated, words):
+            header_words += line
+    footer_words = [w for w in words if id(w) in footer_ids]
+    return ([line_text(l) for l in group_lines(header_words)] if header_words else [],
+            [line_text(l) for l in group_lines(footer_words)] if footer_words else [])
+
+
+def pypdf_page_markdown(text, page, repeated):
+    """pypdf's text for one page, laid out like the PDF.
+
+    pypdf gives the words but no formatting, so each line is looked up in the page layout (font size and
+    weight come from pdfplumber) to find headings, which are printed in bold, and headers and footers,
+    which are printed in italics at the top and bottom. Lines broken in the middle of a word are joined
+    again, and lines that belong to one paragraph are put together."""
+    words = page_words(page)
+    if not words:
+        return text
+    body_size = Counter(round(w["size"]) for w in words).most_common(1)[0][0]
+    headers, footers = page_margin_texts(page, words, repeated)
+    header_keys = {_letters(t) for t in headers}
+    footer_keys = {_letters(t) for t in footers}
+    layout = {}
+    blocks, _ = column_blocks(page, words)
+    for lines in blocks:
+        for line in lines:
+            fact = _line_facts(line)
+            if fact["text"]:
+                layout.setdefault(_letters(fact["text"]), []).append(fact)
+
+    out, paragraph, last_bottom, last_x0 = [], [], None, None
+    top_lines, bottom_lines = [], []
+
+    def end_paragraph():
+        nonlocal paragraph
+        if paragraph:
+            joined = paragraph[0]
+            for nxt in paragraph[1:]:
+                if joined.endswith("-") and nxt[:1].islower() and len(joined) > 2 and joined[-2].isalpha():
+                    joined = joined[:-1] + nxt  # a word split across two lines becomes one word
+                else:
+                    joined += " " + nxt
+            out.append(joined)
+        paragraph = []
+
+    def split_glued(key, depth=0):
+        """pypdf sometimes runs two printed lines together ('CanadaKun Zhang'); cut them where the layout has line ends."""
+        if key in layout and layout[key]:
+            return [key]
+        if depth >= 3:
+            return None
+        for first in sorted((k for k in layout if layout[k] and len(k) >= 6 and key.startswith(k)), key=len, reverse=True):
+            rest = split_glued(key[len(first):], depth + 1) if key[len(first):] else []
+            if rest is not None:
+                return [first] + rest
+        return None
+
+    todo = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        key = _letters(line)
+        if not key:
+            continue
+        if key not in layout and key not in header_keys and key not in footer_keys:
+            pieces = split_glued(key)
+            if pieces and len(pieces) > 1:
+                for piece in pieces:
+                    fact = layout[piece][0]
+                    todo.append((fact["text"], piece))
+                continue
+        todo.append((line, key))
+
+    for line, key in todo:
+        if key in header_keys:
+            top_lines.append(line)
+            continue
+        if key in footer_keys:
+            bottom_lines.append(line)
+            continue
+        matches = layout.get(key)
+        fact = matches.pop(0) if matches else None
+        if fact is None:
+            paragraph.append(line)
+            continue
+        line = fact["text"]  # same letters as pypdf's line, with the spaces between words restored
+        size, bold = fact["size"], fact["bold"]
+        height = fact["bottom"] - fact["top"]
+        gap = (fact["top"] - last_bottom) if last_bottom is not None else 0
+        new_column = last_x0 is not None and abs(fact["x0"] - last_x0) > 60 and gap < 0
+        if re.match(r"^(Figure|Fig\.|Table|Algorithm)\s*\d+", line):
+            end_paragraph()
+            out.append(line)
+        elif size > body_size + 3 and len(line) < 140:
+            end_paragraph()
+            mark = "# " if size > body_size + 6 else "## "
+            if out and out[-1].startswith(mark) and last_bottom is not None and 0 <= gap < height * 1.6:
+                out[-1] = out[-1][:-2] + " " + line + "**"  # a heading that wraps onto a second line
+            else:
+                out.append(f"{mark}**{line}**")
+        elif bold and len(line) < 80 and re.match(r"^(\d+(\.\d+)*\s+)?[A-Z]", line):
+            end_paragraph()
+            out.append(("### " if re.match(r"^\d+\.\d+", line) else "## ") + f"**{line}**")
+        elif re.match(r"^(\d{1,2}[.)]|[\u2022\u25aa\u25e6\u25cf\-\u2013])\s+\S", line):
+            end_paragraph()
+            paragraph.append(line)
+        else:
+            if paragraph and (new_column or gap > height * 0.9):
+                end_paragraph()
+            paragraph.append(line)
+        last_bottom, last_x0 = fact["bottom"], fact["x0"]
+    end_paragraph()
+    italic = lambda lines: "  \n".join("*" + l.replace("*", "\\*") + "*" for l in lines)
+    if top_lines or headers:
+        out.insert(0, italic(top_lines or headers))
+    if bottom_lines or footers:
+        out.append(italic(bottom_lines or footers))
+    return "\n\n".join(out)
+
+
 def convert_with_pypdf(file_path):
-    """Text from pypdf, one section per page. pdfplumber only finds the tables, which are shown as Markdown tables."""
+    """Text from pypdf, one section per page, laid out like the PDF: bold headings, italic headers and
+    footers, whole words and paragraphs. pdfplumber only supplies the layout and finds the tables."""
     import pdfplumber
     from pypdf import PdfReader
 
     reader = PdfReader(str(file_path))
     parts = []
     with pdfplumber.open(str(file_path)) as pdf:
-        for page_num, (page, plumber_page) in enumerate(zip(reader.pages, pdf.pages), start=1):
+        plumber_pages = list(pdf.pages)
+        try:
+            page_list = [page_words(p) for p in plumber_pages[:40]]
+            counts = Counter(t for p, w in zip(plumber_pages, page_list) for t in set(margin_lines(p, w)))
+            repeated = {t for t, n in counts.items() if n >= 2 and len(plumber_pages) > 1}
+        except Exception:
+            repeated = set()
+        for page_num, (page, plumber_page) in enumerate(zip(reader.pages, plumber_pages), start=1):
             text = (page.extract_text() or "").strip()
+            try:
+                text = pypdf_page_markdown(text, plumber_page, repeated)
+            except Exception:
+                pass  # keep pypdf's plain text if the layout lookup fails
             try:
                 tables = extract_page_tables(plumber_page, find_figure_regions(plumber_page))
                 text = put_tables_in_text(text, tables)
             except Exception:
                 pass  # keep the page text even if table detection fails
             parts.append(f"## Page {page_num}\n\n{text}")
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    try:
+        # pypdf prints formulas as loose symbols: put the LaTeX the column reader found in their place
+        result = recognize_docling_formulas(result, file_path)
+    except Exception:
+        pass
+    return result
 
 
 def convert_with_pdfplumber(file_path):
@@ -1183,36 +1329,46 @@ def _letters(text):
 def reader_formulas(reader_text):
     """The formulas in the column reader's text, each with the few words just before and just after it.
 
-    Returns a list of (LaTeX block, text before, text after), all lower-cased letters and digits only."""
+    Formulas that follow each other directly are one group, placed together.
+    Returns a list of (LaTeX blocks, text before, text after), the texts lower-cased letters and digits only."""
     # running headers and footers are italic lines; they are not part of the running text
     reader_text = re.sub(r"(?m)^\*[^\n]*\*\s*$", "", reader_text)
     pieces = FORMULA_LINE.split(reader_text)
-    plain = [piece for index, piece in enumerate(pieces) if index % 2 == 0]
+    plain = [_letters(piece) for index, piece in enumerate(pieces) if index % 2 == 0]
     blocks = [piece.strip() for index, piece in enumerate(pieces) if index % 2 == 1]
-    found = []
+    groups = []
     for i, block in enumerate(blocks):
-        before = _letters(plain[i])[-30:]
-        after = _letters(plain[i + 1])[:30]
-        found.append((block, before, after))
-    return found
+        if groups and len(plain[i]) < 10:
+            groups[-1]["blocks"].append(block)
+            groups[-1]["after"] = plain[i + 1][:40]
+        else:
+            groups.append({"blocks": [block], "before": plain[i][-40:], "after": plain[i + 1][:40]})
+    return [("\n\n".join(g["blocks"]), g["before"], g["after"]) for g in groups]
 
 
 def find_formula_region(raw, letters, positions, before, after, start_at):
-    """Where in Docling's text a formula belongs: the stretch between the words before it and the words after it.
+    """Where in Docling's (or pypdf's) text a formula belongs: the stretch between the words before it and
+    the words after it. The few letters next to the formula may be its own scrambled symbols, so shorter
+    versions of both are tried as well.
 
-    Returns (start, end) character positions in the raw text, or None."""
-    if len(before) < 10 or len(after) < 10:
-        return None
-    a = letters.find(before, start_at)
-    if a < 0:
-        return None
-    a_end = a + len(before)
-    b = letters.find(after, a_end)
-    if b < 0 or b - a_end > 250:
-        return None  # too much text in between: this is not the same place
-    start = positions[a_end - 1] + 1
-    end = positions[b]
-    return start, end, a_end
+    Returns (start, end, next search position), or None."""
+    for trim_before in (0, 6, 12, 18):
+        context = before[:len(before) - trim_before] if trim_before else before
+        context = context[-30:]
+        if len(context) < 10:
+            break
+        a = letters.find(context, start_at)
+        if a < 0:
+            continue
+        a_end = a + len(context)
+        for trim_after in (0, 6, 12, 18):
+            following = after[trim_after:trim_after + 30]
+            if len(following) < 10:
+                break
+            b = letters.find(following, a_end)
+            if b >= 0 and b - a_end <= 250 + trim_before + trim_after:
+                return positions[a_end - 1] + 1, positions[b], a_end
+    return None
 
 
 def recognize_docling_formulas(text, file_path):
