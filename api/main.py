@@ -980,13 +980,52 @@ def formula_to_latex(page, words, number_words):
     return latex
 
 
+def footer_word_ids(page, words, body_size, drop_margin):
+    """Footer text: lone page numbers, running footers repeated on several pages, and the block of small print
+    at the very bottom of the page (licence and copyright notes, 'Preprint' lines) that stands apart from the body."""
+    ids = set()
+    low = page.height * 0.82
+    # page numbers and repeated running footers in the bottom margin
+    for line in group_lines([w for w in words if w["top"] > page.height * 0.89]):
+        text = line_text(line)
+        if re.fullmatch(r"(page\s+)?\d{1,4}", text, re.I) or (line and _in_drop(page, line[0], drop_margin, words)):
+            ids.update(id(w) for w in line)
+    # small print: the lowest lines, smaller than the body, with clear space above them
+    candidates = [w for w in words if w["top"] > low and w["size"] <= body_size - 1
+                  and not any(h in w["fontname"].lower() for h in MATH_FONT_HINTS)]
+    lines = group_lines([w for w in candidates if id(w) not in ids])
+    if lines:
+        cluster = [lines[-1]]
+        for line in reversed(lines[:-1]):
+            height = max(w["bottom"] - w["top"] for w in line)
+            if min(w["top"] for w in cluster[-1]) - max(w["bottom"] for w in line) <= height * 1.8:
+                cluster.append(line)
+            else:
+                break
+        cluster_words = [w for line in cluster for w in line]
+        x0, x1 = min(w["x0"] for w in cluster_words), max(w["x1"] for w in cluster_words)
+        top = min(w["top"] for w in cluster_words)
+        height = max(w["bottom"] - w["top"] for w in cluster_words)
+        above = [w for w in words if id(w) not in {id(c) for c in cluster_words} and w["bottom"] <= top + 1
+                 and w["x1"] > x0 and w["x0"] < x1]
+        nearest = max((w["bottom"] for w in above), default=0)
+        if top - nearest >= height * 2.2 and len(cluster_words) >= 3:
+            ids.update(id(w) for w in cluster_words)
+    return ids
+
+
 def page_to_markdown(page, words, drop_margin=()):
     margin = page.height * 0.11
-    words = [w for w in words if not ((w["bottom"] < margin or w["top"] > page.height - margin)
-                                      and _in_drop(page, w, drop_margin, words))]
     if not words:
         return "", False
     body_size = Counter(round(w["size"]) for w in words).most_common(1)[0][0]
+    footer_ids = footer_word_ids(page, words, body_size, drop_margin)
+    footer_words = [w for w in words if id(w) in footer_ids]
+    # running headers are dropped; footers are kept and printed in italics at the bottom of the page
+    words = [w for w in words if id(w) not in footer_ids and not (w["bottom"] < margin and _in_drop(page, w, drop_margin, words))]
+    footer_lines = [line_text(line) for line in group_lines(footer_words)] if footer_words else []
+    if not words:
+        return "", False
     blocks, two_col = column_blocks(page, words)
     out = []
 
@@ -1065,6 +1104,8 @@ def page_to_markdown(page, words, drop_margin=()):
                 paragraph.append(text)
             last_bottom = f["bottom"]
         end_paragraph()
+    if footer_lines:
+        out.append("  \n".join("*" + line.replace("*", "\\*") + "*" for line in footer_lines if line))
     return "\n\n".join(out), two_col
 
 
