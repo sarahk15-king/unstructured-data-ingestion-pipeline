@@ -421,27 +421,58 @@ def char_in_boxes(obj, boxes):
     return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
 
 
+def pdfplumber_page_text(page, figures):
+    """pdfplumber's words for one page in reading order (column by column), one printed line per line,
+    without the words inside figures. Words keep the spaces between them, so no word is run together."""
+    words = page_words(page, [tuple(b) for b in figures])
+    if not words:
+        return ""
+    blocks, _ = column_blocks(page, words)
+    return "\n".join(line_text(line) for block in blocks for line in block if line)
+
+
 def convert_with_pdfplumber(file_path):
-    """Text from pdfplumber, with each table shown as a Markdown table."""
+    """Text from pdfplumber, one section per page, laid out like the PDF: bold headings, italic headers and
+    footers, whole words and paragraphs, formulas as LaTeX, and each table shown as a Markdown table."""
     import pdfplumber
 
     parts = []
     with pdfplumber.open(str(file_path)) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
+        pages = list(pdf.pages)
+        figure_list = []
+        for page in pages:
             try:
-                figures = find_figure_regions(page)
+                figure_list.append(find_figure_regions(page))
             except Exception:
-                figures = []
+                figure_list.append([])
+        try:
+            page_list = [page_words(p) for p in pages[:40]]
+            counts = Counter(t for p, w in zip(pages, page_list) for t in set(margin_lines(p, w)))
+            repeated = {t for t, n in counts.items() if n >= 2 and len(pages) > 1}
+        except Exception:
+            repeated = set()
+        for page_num, (page, figures) in enumerate(zip(pages, figure_list), start=1):
             # text printed inside a figure (axis labels, legends) stays in the image; only the image link is wanted
             visible = page.filter(lambda obj: not (obj.get("object_type") == "char" and char_in_boxes(obj, figures))) if figures else page
             text = (visible.extract_text() or "").strip()
+            try:
+                ordered = pdfplumber_page_text(page, figures)
+                if ordered.strip():
+                    text = pypdf_page_markdown(ordered, page, repeated)
+            except Exception:
+                pass  # keep pdfplumber's plain text if the layout step fails
             try:
                 tables = extract_page_tables(page, figures)
                 text = put_tables_in_text(text, tables)
             except Exception:
                 pass  # keep the page text even if table detection fails
             parts.append(f"## Page {page_num}\n\n{text}")
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    try:
+        result = recognize_docling_formulas(result, file_path)
+    except Exception:
+        pass
+    return result
 
 
 def html_tables_to_markdown(text):
@@ -498,8 +529,68 @@ def clean_azure_markdown(text):
 
     text = re.sub(r"<figure\b.*?</figure>", figure, text, flags=re.IGNORECASE | re.DOTALL)
     text = html_tables_to_markdown(text)
+    text = italic_page_margins(text)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+AZURE_MARGIN = re.compile(r'<!--\s*(PageHeader|PageFooter|PageNumber)\s*=\s*"(.*?)"\s*-->', re.DOTALL)
+
+
+def italic_page_margins(text):
+    """Azure marks running headers, footers and page numbers with comments. Each page gets its headers in
+    italics at the top and its footers and page number in italics at the bottom."""
+    pages = re.split(r"<!--\s*PageBreak\s*-->", text)
+    result = []
+    for page in pages:
+        headers, footers = [], []
+        for kind, value in AZURE_MARGIN.findall(page):
+            value = " ".join(value.split())
+            if value:
+                (headers if kind == "PageHeader" else footers).append("*" + value.replace("*", "\\*") + "*")
+        body = AZURE_MARGIN.sub("", page).strip()
+        pieces = ["  \n".join(headers)] if headers else []
+        pieces.append(body)
+        if footers:
+            pieces.append("  \n".join(footers))
+        result.append("\n\n".join(p for p in pieces if p))
+    return "\n\n".join(result)
+
+
+def author_block(reader_text):
+    """The title paragraphs and author paragraphs at the start of the column reader's text."""
+    paragraphs = [p.strip() for p in reader_text.split("\n\n") if p.strip()]
+    for index, paragraph in enumerate(paragraphs):
+        if re.match(r"^#*\s*\**abstract\b", paragraph, re.I) and index > 0:
+            front = paragraphs[:index]
+            authors = [p for p in front if not p.startswith("#") and not p.startswith("*")]
+            return authors
+    return []
+
+
+def fix_azure_authors(text, file_path):
+    """Azure reads a two-column title block column by column, so the second author lands after the
+    Introduction. All authors are put right under the title, as printed, and the stray copies are removed."""
+    reader = read_pdf_with_reader(file_path)
+    authors = author_block(reader) if reader else []
+    if not authors:
+        return text
+    paragraphs = [p for p in re.split(r"\n\s*\n", text)]
+    abstract = next((i for i, p in enumerate(paragraphs) if re.match(r"^#*\s*\**abstract\**\s*$", p.strip(), re.I)), None)
+    if abstract is None:
+        return text
+    title_end = max([i for i, p in enumerate(paragraphs[:abstract]) if p.lstrip().startswith("# ")], default=-1)
+    block_letters = _letters(" ".join(authors))
+    keep_front = [p for p in paragraphs[:title_end + 1]]
+    # anything between the title and "Abstract" that is not an author line stays (such as a venue line)
+    middle = [p for p in paragraphs[title_end + 1:abstract] if _letters(p) and _letters(p) not in block_letters]
+    rest = []
+    for i, p in enumerate(paragraphs[abstract:], start=abstract):
+        key = _letters(p)
+        if i > abstract and len(key) >= 8 and key in block_letters and i < len(paragraphs) * 0.6:
+            continue  # the second author, printed after the Introduction
+        rest.append(p)
+    return "\n\n".join(keep_front + authors + middle + rest)
 
 
 def azure_markdown(body, content_type=None, pages=None):
@@ -559,6 +650,11 @@ def convert_with_azure(file_path):
             break
 
     markdown = "\n\n".join(parts)
+    try:
+        markdown = fix_azure_authors(markdown, file_path)
+        markdown = recognize_docling_formulas(markdown, file_path)
+    except Exception:
+        pass  # keep Azure's own text if the extra steps fail
     if total_pages > AZURE_MAX_PAGES:
         markdown += f"\n\n> Only the first {AZURE_MAX_PAGES} of {total_pages} pages were sent to Azure."
     return markdown
