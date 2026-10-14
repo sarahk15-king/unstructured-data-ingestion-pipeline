@@ -186,7 +186,11 @@ def pypdf_page_markdown(text, page, repeated):
     weight come from pdfplumber) to find headings, which are printed in bold, and headers and footers,
     which are printed in italics at the top and bottom. Lines broken in the middle of a word are joined
     again, and lines that belong to one paragraph are put together."""
-    words = page_words(page)
+    try:
+        figure_boxes = find_figure_regions(page)
+    except Exception:
+        figure_boxes = []
+    words = page_words(page, [tuple(b) for b in figure_boxes])  # words inside figures stay in the image
     if not words:
         return text
     body_size = Counter(round(w["size"]) for w in words).most_common(1)[0][0]
@@ -229,20 +233,38 @@ def pypdf_page_markdown(text, page, repeated):
         return None
 
     # words that sit inside a figure: pypdf prints them as loose lines, but they belong to the image
-    try:
-        figure_boxes = find_figure_regions(page)
-    except Exception:
-        figure_boxes = []
-    figure_tokens = set()
+    figure_tokens, shared_tokens = set(), set()
     if figure_boxes:
+        page_tokens = {_letters(w["text"]) for w in words}
         for w in page.extract_words():
             if char_in_boxes(w, figure_boxes):
                 figure_tokens.add(_letters(w["text"]))
         figure_tokens.discard("")
+        # a word that also appears in the running text (such as "the") is only figure text when most of its line is
+        shared_tokens = figure_tokens & page_tokens
 
-    def only_figure_text(line):
-        tokens = [_letters(t) for t in re.split(r"\s+", line) if _letters(t)]
-        return bool(tokens) and all(t in figure_tokens or t.isdigit() for t in tokens)
+    def strip_figure_text(line):
+        """Remove the figure's own words from a line; returns '' when nothing else is left."""
+        tokens = [t for t in re.split(r"\s+", line) if _letters(t)]
+        inside = [t for t in tokens if _letters(t) in figure_tokens]
+        if tokens and len(inside) >= 0.6 * len(tokens):
+            return ""  # a line made mostly of the figure's words is the figure's text
+        # pypdf also glues the figure's words together without spaces: count the letters they cover
+        letters = _letters(line)
+        covered = [False] * len(letters)
+        for token in figure_tokens:
+            if len(token) < 3:
+                continue
+            start = letters.find(token)
+            while start >= 0:
+                for k in range(start, start + len(token)):
+                    covered[k] = True
+                start = letters.find(token, start + 1)
+        if letters and sum(covered) >= 0.7 * len(letters):
+            return ""
+        kept = [t for t in re.split(r"\s+", line) if _letters(t) not in figure_tokens or _letters(t) in shared_tokens]
+        rest = " ".join(kept).strip()
+        return rest if _letters(rest) else ""
 
     todo = []
     for raw in text.split("\n"):
@@ -250,8 +272,11 @@ def pypdf_page_markdown(text, page, repeated):
         key = _letters(line)
         if not key:
             continue
-        if figure_tokens and key not in layout and only_figure_text(line):
-            continue
+        if figure_tokens and key not in layout:
+            line = strip_figure_text(line)
+            key = _letters(line)
+            if not key:
+                continue
         if key not in layout and key not in header_keys and key not in footer_keys:
             pieces = split_glued(key)
             if pieces and len(pieces) > 1:
@@ -308,6 +333,47 @@ def pypdf_page_markdown(text, page, repeated):
     return "\n\n".join(out)
 
 
+def pypdf_page_text(pypdf_page, plumber_page, figures):
+    """pypdf's text for one page, without the text that is drawn inside a figure.
+
+    pypdf reports each piece of text with its position; the pieces that start inside a figure box are
+    skipped, so the figure's labels never reach the Markdown (the figure itself is saved as an image)."""
+    if not figures:
+        return (pypdf_page.extract_text() or "").strip()
+    height, width = float(plumber_page.height), float(plumber_page.width)
+    pieces, last_y = [], [None]
+    # the words pdfplumber finds inside the figures: a piece made only of these words is figure text
+    figure_words = {_letters(w["text"]) for w in plumber_page.extract_words() if char_in_boxes(w, figures)}
+    figure_words.discard("")
+    body_words = {_letters(w["text"]) for w in plumber_page.extract_words() if not char_in_boxes(w, figures)}
+
+    def visit(text, cm, tm, font_dict, font_size):
+        if not text or not text.strip("\n"):
+            return
+        x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+        y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+        top = height - y
+        if 0 <= x <= width and 0 <= top <= height and any(b[0] - 1 <= x <= b[2] + 1 and b[1] - 2 <= top <= b[3] + 2 for b in figures):
+            return
+        # figures drawn inside a scaled graphic report positions that are not reliable: go by the words as well
+        tokens = [_letters(t) for t in text.split() if _letters(t)]
+        if tokens and all(t in figure_words for t in tokens) and (len(tokens) >= 3 or any(t not in body_words for t in tokens)):
+            return
+        if last_y[0] is not None and abs(top - last_y[0]) > 2:
+            pieces.append("\n")
+        pieces.append(text)
+        last_y[0] = top
+
+    try:
+        pypdf_page.extract_text(visitor_text=visit)
+        text = "".join(pieces).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return (pypdf_page.extract_text() or "").strip()
+
+
 def convert_with_pypdf(file_path):
     """Text from pypdf, one section per page, laid out like the PDF: bold headings, italic headers and
     footers, whole words and paragraphs. pdfplumber only supplies the layout and finds the tables."""
@@ -325,7 +391,11 @@ def convert_with_pypdf(file_path):
         except Exception:
             repeated = set()
         for page_num, (page, plumber_page) in enumerate(zip(reader.pages, plumber_pages), start=1):
-            text = (page.extract_text() or "").strip()
+            try:
+                figures = find_figure_regions(plumber_page)
+            except Exception:
+                figures = []
+            text = pypdf_page_text(page, plumber_page, figures)
             try:
                 text = pypdf_page_markdown(text, plumber_page, repeated)
             except Exception:
