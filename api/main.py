@@ -1156,11 +1156,98 @@ def convert_with_markitdown(file_path):
     return MarkItDown().convert(str(file_path)).text_content
 
 
+def read_pdf_with_reader(file_path):
+    """The column reader's Markdown for the whole PDF (formulas as LaTeX), or '' if it fails."""
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(str(file_path)) as pdf:
+            pages = pdf.pages[:40]
+            page_list = [page_words(p, [tuple(b) for b in find_figure_regions(p)]) for p in pages]
+            counts = Counter(t for p, w in zip(pages, page_list) for t in set(margin_lines(p, w)))
+            repeated = {t for t, n in counts.items() if n >= 2 and len(pages) > 1}
+            parts = [page_to_markdown(p, w, repeated)[0] for p, w in zip(pages, page_list)]
+            return "\n\n".join(part for part in parts if part)
+    except Exception:
+        return ""
+
+
+FORMULA_PLACEHOLDER = re.compile(r"[ \t]*<!--\s*formula-not-decoded\s*-->[ \t]*")
+FORMULA_LINE = re.compile(r"(?m)^(\$\$ .*? \$\$.*)$")
+
+
+def _letters(text):
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def reader_formulas(reader_text):
+    """The formulas in the column reader's text, each with the few words just before and just after it.
+
+    Returns a list of (LaTeX block, text before, text after), all lower-cased letters and digits only."""
+    # running headers and footers are italic lines; they are not part of the running text
+    reader_text = re.sub(r"(?m)^\*[^\n]*\*\s*$", "", reader_text)
+    pieces = FORMULA_LINE.split(reader_text)
+    plain = [piece for index, piece in enumerate(pieces) if index % 2 == 0]
+    blocks = [piece.strip() for index, piece in enumerate(pieces) if index % 2 == 1]
+    found = []
+    for i, block in enumerate(blocks):
+        before = _letters(plain[i])[-30:]
+        after = _letters(plain[i + 1])[:30]
+        found.append((block, before, after))
+    return found
+
+
+def find_formula_region(raw, letters, positions, before, after, start_at):
+    """Where in Docling's text a formula belongs: the stretch between the words before it and the words after it.
+
+    Returns (start, end) character positions in the raw text, or None."""
+    if len(before) < 10 or len(after) < 10:
+        return None
+    a = letters.find(before, start_at)
+    if a < 0:
+        return None
+    a_end = a + len(before)
+    b = letters.find(after, a_end)
+    if b < 0 or b - a_end > 250:
+        return None  # too much text in between: this is not the same place
+    start = positions[a_end - 1] + 1
+    end = positions[b]
+    return start, end, a_end
+
+
+def recognize_docling_formulas(text, file_path):
+    """Put a LaTeX formula wherever the paper has one, whatever Docling printed there.
+
+    Docling on the light settings either leaves '<!-- formula-not-decoded -->' or prints the formula as
+    scrambled symbols (or skips it). The column reader finds the paper's display formulas as LaTeX, and
+    each one is placed by matching the words around it with Docling's own text. Whatever Docling printed
+    between those words (marker, scrambled symbols or nothing) is replaced by the formula."""
+    reader = read_pdf_with_reader(file_path)
+    formulas = reader_formulas(reader) if reader else []
+    positions, chars = [], []
+    for index, ch in enumerate(text):
+        if ch.isalnum() and ch.isascii():
+            chars.append(ch.lower())
+            positions.append(index)
+    letters = "".join(chars)
+    edits, cursor = [], 0
+    for block, before, after in formulas:
+        region = find_formula_region(text, letters, positions, before, after, cursor)
+        if region:
+            start, end, cursor = region[0], region[1], region[2]
+            edits.append((start, end, "\n\n" + block + "\n\n"))
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    # any marker that is still left has no formula to take its place
+    return FORMULA_PLACEHOLDER.sub("", text)
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         text = convert_with_docling(file_path)
         # Docling leaves "<!-- image -->" where a picture was; the real image links are placed separately
         text = re.sub(r"[ \t]*<!--\s*image\s*-->[ \t]*\n?", "", text)
+        text = recognize_docling_formulas(text, file_path)
         return re.sub(r"\n{3,}", "\n\n", text)
     elif tool == "markitdown":
         return convert_with_markitdown(file_path)
