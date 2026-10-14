@@ -1022,7 +1022,14 @@ def page_to_markdown(page, words, drop_margin=()):
     footer_ids = footer_word_ids(page, words, body_size, drop_margin)
     footer_words = [w for w in words if id(w) in footer_ids]
     # running headers are dropped; footers are kept and printed in italics at the bottom of the page
-    words = [w for w in words if id(w) not in footer_ids and not (w["bottom"] < margin and _in_drop(page, w, drop_margin, words))]
+    header_words = []
+    for line in group_lines([w for w in words if w["bottom"] < margin and id(w) not in footer_ids]):
+        text = line_text(line)
+        if re.fullmatch(r"(page\s+)?\d{1,4}", text, re.I) or _in_drop(page, line[0], drop_margin, words):
+            header_words += line
+    header_ids = {id(w) for w in header_words}
+    header_lines = [line_text(line) for line in group_lines(header_words)] if header_words else []
+    words = [w for w in words if id(w) not in footer_ids and id(w) not in header_ids]
     footer_lines = [line_text(line) for line in group_lines(footer_words)] if footer_words else []
     if not words:
         return "", False
@@ -1104,6 +1111,8 @@ def page_to_markdown(page, words, drop_margin=()):
                 paragraph.append(text)
             last_bottom = f["bottom"]
         end_paragraph()
+    if header_lines:
+        out.insert(0, "  \n".join("*" + line.replace("*", "\\*") + "*" for line in header_lines if line))
     if footer_lines:
         out.append("  \n".join("*" + line.replace("*", "\\*") + "*" for line in footer_lines if line))
     return "\n\n".join(out), two_col
