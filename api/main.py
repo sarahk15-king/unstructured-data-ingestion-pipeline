@@ -1,10 +1,12 @@
 import csv
+from collections import Counter
 import io
 import json
 import os
 import re
 import shutil
 import tempfile
+import unicodedata
 from datetime import date
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -130,37 +132,34 @@ def put_tables_in_text(text, tables):
 
 
 def fix_markdown_tables(markdown_text, tables):
-    """Replace tables that MarkItDown got wrong with the tables found by pdfplumber.
+    """Replace tables that the converter got wrong with the tables found by pdfplumber.
 
-    MarkItDown sometimes merges columns ("Quarter North") or leaves a table as loose lines. For each
-    pdfplumber table, find the run of lines whose words match the table's words, in order, and put a
-    clean Markdown table there.
+    MarkItDown sometimes merges columns ("Quarter North"), and column-by-column reading leaves a
+    table as loose lines. For each pdfplumber table, find where its text sits in the Markdown, as
+    one run of characters whatever the spacing and line breaks, and put a clean Markdown table there.
     """
-    def words(text):
-        return re.sub(r"[|]|(?<!\w)-{3,}(?!\w)", " ", text).split()
-
-    lines = markdown_text.split("\n")
     for rows in tables:
-        target = [w for row in rows for cell in row for w in (cell or "").split()]
-        if not target:
+        target = "".join(ch for row in rows for cell in row for ch in (cell or "") if not ch.isspace())
+        if len(target) < 6:
             continue
-        found = None
-        for start in range(len(lines)):
-            if not words(lines[start]) or words(lines[start])[0] != target[0]:
-                continue
-            got = []
-            for end in range(start, min(len(lines), start + len(rows) * 3 + 6)):
-                got += words(lines[end])
-                if got == target:
-                    found = (start, end + 1)
-                    break
-                if len(got) >= len(target) or got != target[:len(got)]:
-                    break
-            if found:
-                break
-        if found:
-            lines[found[0]:found[1]] = ["", rows_to_markdown(rows), ""]
-    return "\n".join(lines)
+        skip = set()
+        for dashes in re.finditer(r"-{3,}", markdown_text):
+            skip.update(range(dashes.start(), dashes.end()))
+        positions = [i for i, ch in enumerate(markdown_text) if not ch.isspace() and ch != "|" and i not in skip]
+        squeezed = "".join(markdown_text[i] for i in positions)
+        # also ignore the dashes of a Markdown table's separator row when matching
+        found = squeezed.find(target)
+        if found < 0:
+            continue
+        start = positions[found]
+        end = positions[found + len(target) - 1] + 1
+        # take the whole line when the run starts or ends inside a Markdown table row
+        while start > 0 and markdown_text[start - 1] in "| ":
+            start -= 1
+        while end < len(markdown_text) and markdown_text[end] in "| ":
+            end += 1
+        markdown_text = markdown_text[:start] + "\n\n" + rows_to_markdown(rows) + "\n\n" + markdown_text[end:]
+    return re.sub(r"\n{3,}", "\n\n", markdown_text)
 
 
 def convert_with_pypdf(file_path):
@@ -383,14 +382,721 @@ def convert_with_docling(file_path):
     return light_docling_converter(DocumentConverter).convert(str(file_path)).document.export_to_markdown()
 
 
+MATH_FONT_HINTS = ("math", "cmmi", "cmsy", "cmex", "msam", "msbm", "txsys", "txexs", "txmia", "txsym", "symbol", "stix", "mi7", "mtmi", "mtsy", "mtextra", "euler", "lmmath", "standardsym")
+
+
+def _is_math_char(char):
+    name = char.get("fontname", "").lower()
+    return any(hint in name for hint in MATH_FONT_HINTS) or ord(char["text"][0]) > 0x2000
+
+
+def find_gutters(words, page_width):
+    """x ranges of the empty strips between text columns (one strip for 2 columns, two for 3), or [] for one column."""
+    if len(words) < 40:
+        return []
+    lo, hi = page_width * 0.12, page_width * 0.88
+    xs = [lo + i for i in range(int(hi - lo) + 1)]
+    covered = [0] * len(xs)
+    for w in words:
+        for i, x in enumerate(xs):
+            if w["x0"] <= x <= w["x1"]:
+                covered[i] += 1
+    # a column gap is a run of x positions that almost no word crosses
+    limit = max(2, len(words) * 0.02)
+    runs, start = [], None
+    for i, c in enumerate(covered + [10 ** 9]):
+        if c <= limit and start is None:
+            start = i
+        elif c > limit and start is not None:
+            if i - start >= 6:
+                runs.append((xs[start], xs[i - 1]))
+            start = None
+    gutters = []
+    for g0, g1 in runs:
+        left = sum(1 for w in words if w["x1"] <= g0 + 1)
+        right = sum(1 for w in words if w["x0"] >= g1 - 1)
+        if left >= len(words) * 0.15 and right >= len(words) * 0.15:
+            gutters.append((g0, g1))
+    return gutters[:2]
+
+
+def find_gutter(words, page_width):
+    """The central gutter of a two-column page, or None."""
+    for g0, g1 in find_gutters(words, page_width):
+        if page_width * 0.38 <= (g0 + g1) / 2 <= page_width * 0.62:
+            return g0, g1
+    return None
+
+
+def group_lines(words, tolerance=3.5):
+    """Words -> lines (lists of words, left to right), by vertical position."""
+    lines = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        mid = (w["top"] + w["bottom"]) / 2
+        for line in lines:
+            if abs(line["mid"] - mid) <= tolerance:
+                line["words"].append(w)
+                line["mid"] = sum((x["top"] + x["bottom"]) / 2 for x in line["words"]) / len(line["words"])
+                break
+        else:
+            lines.append({"mid": mid, "words": [w]})
+    out = []
+    for line in sorted(lines, key=lambda l: l["mid"]):
+        out.append(sorted(line["words"], key=lambda w: w["x0"]))
+    return out
+
+
+def line_text(words):
+    text = ""
+    previous = None
+    for w in words:
+        if previous is not None:
+            gap = w["x0"] - previous["x1"]
+            size = max(w.get("size", 10), 1)
+            if gap > size * 0.12:
+                text += " "
+        text += w["text"]
+        previous = w
+    return text.strip()
+
+
+def column_blocks(page, words):
+    """Reading order: full-width lines stay where they are, each band of columns reads left to right,
+    one column after the other. Works for two or three columns.
+
+    Returns a list of blocks (each a list of lines) and whether the page has columns."""
+    gutters = find_gutters(words, page.width)
+    all_lines = group_lines(words)
+    if not gutters:
+        return [all_lines], False
+    middles = [(g0 + g1) / 2 for g0, g1 in gutters]
+    gutter_width = min(g1 - g0 for g0, g1 in gutters)
+    blocks, bands = [], [[] for _ in range(len(gutters) + 1)]
+
+    def flush():
+        nonlocal bands
+        for side in bands:
+            if side:
+                blocks.append(group_lines(side))
+        bands = [[] for _ in range(len(gutters) + 1)]
+
+    def column_of(w):
+        centre = (w["x0"] + w["x1"]) / 2
+        return sum(1 for mid in middles if centre > mid)
+
+    def full_width(line):
+        if any(w["x0"] < mid < w["x1"] for w in line for mid in middles):
+            return True
+        used = {column_of(w) for w in line}
+        if len(used) > 1:
+            # one line of text that happens to break at a gutter: the gap is a normal word space
+            for mid in middles:
+                left = [w for w in line if w["x1"] <= mid]
+                right = [w for w in line if w["x0"] >= mid]
+                if left and right and min(w["x0"] for w in right) - max(w["x1"] for w in left) < gutter_width * 0.6:
+                    return True
+        return False
+
+    for line in all_lines:
+        if full_width(line):
+            flush()
+            blocks.append([line])
+        else:
+            for w in line:
+                bands[column_of(w)].append(w)
+    flush()
+    return blocks, True
+
+
+# ---- formulas to LaTeX ----
+GREEK = {
+    "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "varepsilon", "ϵ": "epsilon", "ζ": "zeta",
+    "η": "eta", "θ": "theta", "ϑ": "vartheta", "ι": "iota", "κ": "kappa", "λ": "lambda", "μ": "mu", "µ": "mu",
+    "ν": "nu", "ξ": "xi", "ο": "o", "π": "pi", "ϖ": "varpi", "ρ": "rho", "ϱ": "varrho", "σ": "sigma",
+    "ς": "varsigma", "τ": "tau", "υ": "upsilon", "φ": "varphi", "ϕ": "phi", "χ": "chi", "ψ": "psi", "ω": "omega",
+    "Γ": "Gamma", "Δ": "Delta", "Θ": "Theta", "Λ": "Lambda", "Ξ": "Xi", "Π": "Pi", "Σ": "Sigma",
+    "Υ": "Upsilon", "Φ": "Phi", "Ψ": "Psi", "Ω": "Omega",
+}
+SYMBOLS = {
+    "−": "-", "–": "-", "—": "-", "∥": r"\|", "∈": r"\in", "∉": r"\notin", "≤": r"\leq", "≥": r"\geq", "×": r"\times",
+    "·": r"\cdot", "∙": r"\cdot", "⋅": r"\cdot", "∑": r"\sum", "∏": r"\prod", "∫": r"\int", "∞": r"\infty",
+    "→": r"\to", "←": r"\leftarrow", "⇒": r"\Rightarrow", "⇔": r"\Leftrightarrow", "∂": r"\partial", "∇": r"\nabla",
+    "±": r"\pm", "∓": r"\mp", "≈": r"\approx", "≠": r"\neq", "∝": r"\propto", "∼": r"\sim", "≡": r"\equiv",
+    "⊂": r"\subset", "⊆": r"\subseteq", "∪": r"\cup", "∩": r"\cap", "∀": r"\forall", "∃": r"\exists", "∅": r"\emptyset",
+    "′": "'", "∆": r"\Delta", "̸": "", "⊤": r"^{\top}", "ℝ": r"\mathbb{R}", "ℕ": r"\mathbb{N}", "ℤ": r"\mathbb{Z}", "ℂ": r"\mathbb{C}",
+    "𝔼": r"\mathbb{E}", "ℙ": r"\mathbb{P}", "{": r"\{", "}": r"\}", "%": r"\%", "&": r"\&", "#": r"\#", "_": r"\_",
+    "⟨": r"\langle", "⟩": r"\rangle", "⌊": r"\lfloor", "⌋": r"\rfloor", "⌈": r"\lceil", "⌉": r"\rceil", "‖": r"\|",
+    "∘": r"\circ", "⊙": r"\odot", "⊗": r"\otimes", "⊕": r"\oplus", "…": r"\ldots", "⋯": r"\cdots", "<": "<", ">": ">",
+    "∼": r"\sim", "≪": r"\ll", "≫": r"\gg", "∥": r"\|", "√": r"\surd", "−": "-",
+}
+FUNCTIONS = {"exp", "log", "ln", "min", "max", "sin", "cos", "tan", "tanh", "sinh", "cosh", "lim", "sup", "inf",
+             "det", "arg", "argmax", "argmin", "softmax", "KL", "Var", "Cov", "E", "Pr", "dim", "rank", "tr", "diag", "sign"}
+NAMED_FUNCTIONS = {"exp", "log", "ln", "min", "max", "sin", "cos", "tan", "tanh", "sinh", "cosh", "lim", "sup", "inf", "det", "dim", "arg"}
+BIG_OPERATORS = {"∑", "∏", "∫", "⋃", "⋂"}
+ACCENTS = {"ˆ": r"\hat", "^": r"\hat", "˜": r"\tilde", "~": r"\tilde", "¯": r"\bar", "‾": r"\bar", "˙": r"\dot", "¨": r"\ddot", "→": r"\vec"}
+ITALIC_FONT_HINTS = ("ital", "cmmi", "oblique", "slant", "mathit", "mmi", "-mi", "mi7", "math italic")
+
+
+def _is_extension_font(char):
+    name = char.get("fontname", "").lower()
+    return "cmex" in name or "exs" in name.split("+")[-1] or "mex" in name
+
+
+def _is_italic(char):
+    name = char.get("fontname", "").lower()
+    return any(h in name for h in ITALIC_FONT_HINTS) or name.endswith("mi") or "mathmi" in name.replace("-", "").replace("_", "")
+
+
+def _normalise(text):
+    """Math italic / bold letters become plain letters; returns (plain text, was_math_alphanumeric)."""
+    plain = unicodedata.normalize("NFKC", text)
+    return plain, plain != text
+
+
+def _symbol(text):
+    if text in SYMBOLS:
+        return SYMBOLS[text]
+    if text in GREEK:
+        return "\\" + GREEK[text]
+    return text
+
+
+def _items_from_chars(chars):
+    items = []
+    for ch in chars:
+        text = ch["text"]
+        if text.startswith("(cid:"):
+            n = int(re.sub(r"\D", "", text) or -1)
+            if _is_extension_font(ch):
+                text = {88: "∑", 80: "∑", 89: "∏", 81: "∏", 90: "∫", 82: "∫",
+                        0: "(", 1: ")", 112: "√", 113: "√", 114: "√", 115: "√", 116: "√", 16: "(", 18: "(", 32: "(", 17: ")", 19: ")", 33: ")"}.get(n, "")
+            else:
+                text = "(" if n == 0 else ")" if n == 1 else ""
+        text = re.sub("[︀-️​]", "", text)
+        if not text.strip():
+            continue
+        plain, math_alnum = _normalise(text)
+        items.append({
+            "text": plain, "x0": ch["x0"], "x1": ch["x1"], "top": ch["top"], "bottom": ch["bottom"],
+            "size": ch.get("size", 10), "italic": _is_italic(ch) or math_alnum,
+            "cy": (ch["top"] + ch["bottom"]) / 2, "latex": None,
+            "base": -ch["matrix"][5] if ch.get("matrix") else ch["bottom"] - 0.22 * ch.get("size", 10),
+            "big": _is_extension_font(ch) and text in "()",
+        })
+    return items
+
+
+def _span(items):
+    return min(i["x0"] for i in items), max(i["x1"] for i in items), min(i["top"] for i in items), max(i["bottom"] for i in items)
+
+
+def _placeholder(latex, region):
+    x0, x1, top, bottom = region
+    return {"text": "", "x0": x0, "x1": x1, "top": top, "bottom": bottom, "size": 10, "italic": False,
+            "cy": (top + bottom) / 2, "latex": latex}
+
+
+def _barless_fraction_rules(items, base_size):
+    """A fraction drawn inside tall brackets with no bar: two rows of text stacked between '(' and ')'.
+    A bar is invented between the rows so the normal fraction code handles it."""
+    opens = sorted([i for i in items if i.get("big") and i["text"] == "("], key=lambda i: i["x0"])
+    closes = sorted([i for i in items if i.get("big") and i["text"] == ")"], key=lambda i: i["x0"])
+    found = []
+    for o in opens:
+        c = next((c for c in closes if c["x0"] > o["x1"]), None)
+        if c is None:
+            continue
+        inner = [i for i in items if o["x1"] <= (i["x0"] + i["x1"]) / 2 <= c["x0"] and i["latex"] is None and not i.get("big")]
+        if len(inner) < 2:
+            continue
+        rows = []
+        for i in sorted(inner, key=lambda i: i["cy"]):
+            if rows and abs(i["cy"] - rows[-1][-1]["cy"]) < base_size * 0.45:
+                rows[-1].append(i)
+            else:
+                rows.append([i])
+        if len(rows) != 2:
+            continue
+        top_row, bottom_row = rows
+        mid = (max(i["bottom"] for i in top_row) + min(i["top"] for i in bottom_row)) / 2
+        found.append({"x0": o["x1"], "x1": c["x0"], "top": mid - 0.3, "bottom": mid + 0.3, "parens": [o, c]})
+    return found
+
+
+def parse_layout(items, rules, base_size=None):
+    """LaTeX for a group of positioned characters (items) and thin horizontal rules (fraction bars)."""
+    items = [i for i in items]
+    if not items:
+        return ""
+    if base_size is None:
+        sizes = [round(i["size"], 1) for i in items if i["text"].strip()]
+        base_size = max(set(sizes), key=sizes.count) if sizes else 10
+
+    rules = list(rules)
+    for synthetic in _barless_fraction_rules(items, base_size):
+        overlapped = any(min(r["x1"], synthetic["x1"]) - max(r["x0"], synthetic["x0"]) > 0.5 * (synthetic["x1"] - synthetic["x0"]) and
+                         abs((r["top"] + r["bottom"]) / 2 - (synthetic["top"] + synthetic["bottom"]) / 2) < base_size * 2 for r in rules)
+        if not overlapped:
+            rules.append(synthetic)
+    rules = sorted(rules, key=lambda r: -(r["x1"] - r["x0"]))
+    used = set()
+    # fractions and roots: the widest bar first, so a bar inside a numerator is handled inside it
+    for index, rule in enumerate(rules):
+        if index in used:
+            continue
+        cy = (rule["top"] + rule["bottom"]) / 2
+        inside = [i for i in items if rule["x0"] - 2 <= (i["x0"] + i["x1"]) / 2 <= rule["x1"] + 2
+                  and abs(i["cy"] - cy) < base_size * 3.2 and i["latex"] is None and not i.get("big")]
+        above = [i for i in inside if i["cy"] < cy - 0.5]
+        below = [i for i in inside if i["cy"] > cy + 0.5]
+        inner = [(k, r) for k, r in enumerate(rules) if k != index and k not in used
+                 and r["x0"] >= rule["x0"] - 2 and r["x1"] <= rule["x1"] + 2 and abs((r["top"] + r["bottom"]) / 2 - cy) < base_size * 3.2]
+        if not above and not below:
+            continue
+        used.add(index)
+        for k, _ in inner:
+            used.add(k)
+        num_rules = [r for k, r in inner if (r["top"] + r["bottom"]) / 2 < cy]
+        den_rules = [r for k, r in inner if (r["top"] + r["bottom"]) / 2 >= cy]
+        if above and below:
+            latex = r"\frac{%s}{%s}" % (parse_layout(above, num_rules, base_size), parse_layout(below, den_rules, base_size))
+            members = above + below
+        elif below and not above:
+            latex = r"\overline{%s}" % parse_layout(below, [], base_size)
+            members = below
+        else:
+            continue
+        # a radical sign just left of the bar turns an overline into a square root
+        radicals = [i for i in items if i["text"] == "√" and abs(i["x1"] - rule["x0"]) < base_size * 0.8]
+        if radicals and latex.startswith(r"\overline"):
+            latex = r"\sqrt{%s}" % latex[len(r"\overline{"):-1]
+            members = members + radicals
+        parens = rule.get("parens")
+        if not parens:
+            left = [i for i in items if i.get("big") and i["text"] == "(" and 0 <= rule["x0"] - i["x1"] < base_size * 0.9]
+            right = [i for i in items if i.get("big") and i["text"] == ")" and 0 <= i["x0"] - rule["x1"] < base_size * 0.9]
+            parens = [left[-1], right[0]] if left and right else None
+        if parens:
+            latex = r"\left( %s \right)" % latex
+            members = members + parens
+        ids = {id(m) for m in members}
+        region = _span(members + [{"x0": rule["x0"], "x1": rule["x1"], "top": rule["top"], "bottom": rule["bottom"]}])
+        items = [i for i in items if id(i) not in ids]
+        # the fraction sits on the main baseline, not at its own height
+        items.append(_placeholder(latex, region))
+
+    return _parse_line(items, base_size)
+
+
+def _parse_line(items, base_size):
+    items = sorted(items, key=lambda i: (i["x0"] + i["x1"]) / 2)
+    normal = [i for i in items if i["latex"] is None and i["size"] >= base_size * 0.88 and i["text"] not in BIG_OPERATORS]
+    if normal:
+        ordered = sorted(i["cy"] for i in normal)
+        baseline = ordered[len(ordered) // 2]
+    else:
+        baseline = sum(i["cy"] for i in items) / len(items)
+
+    def foot(i):
+        return i.get("base", i["bottom"] - 0.22 * i["size"])
+
+    base_foot = sorted(foot(i) for i in normal)[len(normal) // 2] if normal else baseline
+
+    def role(i):
+        if i["latex"] is not None or i["text"] in BIG_OPERATORS:
+            return "main"
+        if i["size"] < base_size * 0.88:
+            if foot(i) < base_foot - base_size * 0.22:
+                return "sup"
+            if foot(i) > base_foot + base_size * 0.08:
+                return "sub"
+        return "main"
+
+    nodes = []  # each: {"item": ..., "sup": [], "sub": [], "limits": bool}
+    mains = [i for i in items if role(i) == "main"]
+    scripts = [i for i in items if role(i) != "main"]
+    # scripts attach to the nearest main item to their left (or above/below a big operator)
+    for m in mains:
+        nodes.append({"item": m, "sup": [], "sub": []})
+    for s in scripts:
+        centre = (s["x0"] + s["x1"]) / 2
+        target = None
+        for node in nodes:
+            m = node["item"]
+            if m["text"] in BIG_OPERATORS and m["x0"] - 4 <= centre <= m["x1"] + 4:
+                target = node
+                break
+        if target is None:
+            candidates = [n for n in nodes if n["item"]["x1"] <= s["x1"] + 1.5 and (n["item"]["x0"] + n["item"]["x1"]) / 2 <= centre]
+            target = candidates[-1] if candidates else (nodes[0] if nodes else None)
+        if target is None:
+            continue
+        target["sup" if role(s) == "sup" else "sub"].append(s)
+
+    pieces = _tokens([n["item"] for n in nodes], nodes)
+    return " ".join(p for p in pieces if p).strip()
+
+
+def _function_at(nodes, i):
+    """If the letters starting at node i spell a known function name (min, argmax, softmax...), return (name, number of nodes)."""
+    letters, owners = "", []
+    for k in range(i, len(nodes)):
+        it = nodes[k]["item"]
+        if it["latex"] is not None or not it["text"].isalpha() or not it["text"].isascii():
+            break
+        letters += it["text"]
+        owners.append(k)
+    for name in sorted(FUNCTIONS, key=len, reverse=True):
+        if letters.startswith(name) and len(name) >= 2:
+            count = 0
+            used = ""
+            for k in owners:
+                used += nodes[k]["item"]["text"]
+                count += 1
+                if len(used) >= len(name):
+                    break
+            if used == name:
+                return name, count
+    return None
+
+
+def _script_text(parts):
+    parts = sorted(parts, key=lambda i: i["x0"])
+    out = _tokens(parts, [{"item": p, "sup": [], "sub": []} for p in parts])
+    # three or more plain letters in a row are a word (old, phys): set them upright
+    if len(parts) >= 3 and all(p["text"].isalpha() and p["text"].isascii() and p["latex"] is None for p in parts):
+        return [r"\mathrm{%s}" % "".join(p["text"] for p in parts)]
+    return out
+
+
+def _tokens(mains, nodes):
+    out = []
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
+        item = node["item"]
+        text = item["text"]
+        # accents sit over the previous letter: yˆ -> \hat{y}
+        if out and text in ACCENTS and nodes[i - 1]["item"]["x0"] - 2 <= (item["x0"] + item["x1"]) / 2 <= nodes[i - 1]["item"]["x1"] + 4 and item["latex"] is None:
+            out[-1] = ACCENTS[text] + "{" + out[-1] + "}"
+            i += 1
+            continue
+        func = _function_at(nodes, i)
+        if item["latex"] is not None:
+            token = item["latex"]
+        elif func:
+            name, count = func
+            last = i + count - 1
+            for k in range(i, last):
+                nodes[last]["sub"] += nodes[k]["sub"]
+                nodes[last]["sup"] += nodes[k]["sup"]
+            i = last
+            node = nodes[i]
+            token = ("\\" + name) if name in NAMED_FUNCTIONS else (r"\operatorname{%s}" % name)
+        elif text.isalpha() and text.isascii() and not item["italic"]:
+            # a run of upright letters is a word: exp, log, softmax
+            j, word = i, ""
+            while j < len(nodes):
+                it = nodes[j]["item"]
+                if it["latex"] is None and it["text"].isascii() and it["text"].isalpha() and not it["italic"]:
+                    word += it["text"]
+                    j += 1
+                    if nodes[j - 1]["sup"] or nodes[j - 1]["sub"]:
+                        break
+                else:
+                    break
+            node = nodes[j - 1]
+            i = j - 1
+            if len(word) >= 2:
+                token = ("\\" + word) if word in NAMED_FUNCTIONS else (r"\operatorname{%s}" % word)
+            else:
+                token = word
+        else:
+            token = _symbol(text)
+        if node["item"]["text"] in BIG_OPERATORS or node["sub"] or node["sup"]:
+            if node["sub"]:
+                token += "_{%s}" % " ".join(_script_text(node["sub"]))
+            if node["sup"]:
+                token += "^{%s}" % " ".join(_script_text(node["sup"]))
+        out.append(token)
+        i += 1
+    return out
+
+
+def equation_latex(page, words, skip_words=()):
+    """LaTeX for one display equation, from the words (and their characters and fraction bars) on the page."""
+    x0 = min(w["x0"] for w in words) - 3
+    x1 = max(w["x1"] for w in words) + 3
+    top = min(w["top"] for w in words) - 2
+    bottom = max(w["bottom"] for w in words) + 2
+    skip = [(w["x0"] - 0.5, w["top"] - 1, w["x1"] + 0.5, w["bottom"] + 1) for w in skip_words]
+    chars = []
+    for c in page.chars:
+        if not (x0 <= (c["x0"] + c["x1"]) / 2 <= x1 and top <= (c["top"] + c["bottom"]) / 2 <= bottom):
+            continue
+        if any(b[0] <= (c["x0"] + c["x1"]) / 2 <= b[2] and b[1] <= (c["top"] + c["bottom"]) / 2 <= b[3] for b in skip):
+            continue
+        chars.append(c)
+    rules = []
+    for obj in list(page.lines) + list(page.rects):
+        height = obj["bottom"] - obj["top"]
+        width = obj["x1"] - obj["x0"]
+        if height < 1.8 and width > 5 and obj["x0"] >= x0 - 2 and obj["x1"] <= x1 + 2 and top - 1 <= obj["top"] <= bottom + 1:
+            rules.append({"x0": obj["x0"], "x1": obj["x1"], "top": obj["top"], "bottom": obj["bottom"]})
+    items = _items_from_chars(chars)
+    sizes = [round(c["size"], 1) for c in page.chars if c["text"].strip()]
+    body = max(set(sizes), key=sizes.count) if sizes else None
+    return parse_layout(items, rules, body)
+
+
+def classify(line, body_size):
+    """paragraph / heading / equation for one line of words."""
+    text = line_text(line)
+    chars = [c for w in line for c in w.get("chars", [])]
+    size = Counter(round(w.get("size", body_size)) for w in line).most_common(1)[0][0]
+    bold = all("bold" in w.get("fontname", "").lower() or w.get("fontname", "").lower().endswith(("b", "bd")) for w in line)
+    math_share = (sum(1 for c in chars if _is_math_char(c)) / len(chars)) if chars else 0
+    return text, size, bold, math_share
+
+
+def clean_math(text):
+    text = re.sub("[\ufe00-\ufe0f]", "", text)
+    text = text.replace("(cid:0)", "(").replace("(cid:1)", ")")
+    return re.sub(r"\(cid:\d+\)", "", text)
+
+
+def margin_lines(page, words, fraction=0.11):
+    """Text of the lines in the top and bottom margin of the page (running headers, page numbers)."""
+    found = []
+    for line in group_lines([w for w in words if w["bottom"] < page.height * fraction or w["top"] > page.height * (1 - fraction)]):
+        found.append(" ".join(re.sub(r"\d+", "#", line_text(line)).split()[:4]))
+    return found
+
+
+def page_words(page, skip_boxes=()):
+    words = page.extract_words(x_tolerance=1.5, extra_attrs=["fontname", "size", "upright"])
+    words = [w for w in words if w.get("upright", True)]
+
+    def inside(w):
+        cx, cy = (w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2
+        return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in skip_boxes)
+
+    return [w for w in words if not inside(w)]
+
+
+MATH_SYMBOLS = set("=<>≤≥≈≠∑∏∫√∥∈∉⊂⊆∀∃∂∇±×·∝→←⇒⇔∞ˆ˜")
+
+
+def _line_facts(line):
+    text = clean_math(line_text(line)).strip()
+    chars = sum(len(w["text"]) for w in line) or 1
+    math = sum(len(w["text"]) for w in line if any(h in w["fontname"].lower() for h in MATH_FONT_HINTS))
+    sizes = Counter(round(w["size"]) for w in line)
+    return {
+        "text": text, "words": line,
+        "x0": min(w["x0"] for w in line), "x1": max(w["x1"] for w in line),
+        "top": min(w["top"] for w in line), "bottom": max(w["bottom"] for w in line),
+        "size": sizes.most_common(1)[0][0],
+        "share": math / chars,
+        "bold": all(any(k in w["fontname"].lower() for k in ("bold", "medi", "black", "heavy")) or w["fontname"].lower().endswith(("tb", "-bd")) for w in line),
+    }
+
+
+def _equation_groups(facts, body_size):
+    """Indexes of the lines of each display equation in one column, including sum limits and fractions."""
+    if not facts:
+        return []
+    x0 = min(f["x0"] for f in facts)
+    x1 = max(f["x1"] for f in facts)
+    width = max(x1 - x0, 1)
+    seeds, fragments = [], set()
+    relations = set("=<>≤≥≈≠∈∝→⇒⇔")
+    for i, f in enumerate(facts):
+        text = f["text"]
+        words = len(text.split())
+        number_word = any(re.fullmatch(r"\(\d{1,3}\)", w["text"]) and w["x0"] > x0 + 0.55 * width for w in f["words"])
+        relation = any(ch in relations for ch in text)
+        symbols = sum(1 for ch in text if ch in MATH_SYMBOLS)
+        left_gap, right_gap = f["x0"] - x0, x1 - f["x1"]
+        # the number sits at the right edge, so only the left gap tells whether a numbered line is centred
+        centred = left_gap > 0.06 * width if number_word else (left_gap > 0.06 * width and right_gap > 0.06 * width)
+        display = len(text) < 140 and words <= 26 and (
+            (number_word and (relation or f["share"] > 0.1 or centred))
+            or (relation and (f["share"] > 0.3 or centred) and not text.endswith((".", ":")) and len(text) > 5)
+            or (f["share"] > 0.5 and len(text) > 25)
+        )
+        if display:
+            seeds.append(i)
+        elif len(text) <= 24 and (f["share"] > 0.4 or f["size"] < body_size - 1 or symbols or all(len(w["text"]) <= 2 for w in f["words"])):
+            fragments.add(i)
+    groups = {i: [i] for i in seeds}
+    for i in fragments:
+        best, distance = None, None
+        for j in seeds:
+            gap = (facts[i]["top"] - facts[j]["bottom"]) if i > j else (facts[j]["top"] - facts[i]["bottom"])
+            line_height = max(facts[j]["bottom"] - facts[j]["top"], 8)
+            horizontal = facts[i]["x1"] > facts[j]["x0"] - 10 and facts[i]["x0"] < facts[j]["x1"] + 10
+            if gap < line_height * 1.8 and horizontal and (distance is None or gap < distance):
+                best, distance = j, gap
+        if best is not None:
+            groups[best].append(i)
+    return [sorted(members) for members in groups.values()]
+
+
+def looks_like_prose(text):
+    """Three or more long ordinary words in a row of 'equation' text means it is a sentence, not a formula."""
+    long_words = [w for w in re.findall(r"[A-Za-z]{5,}", text) if w.lower() not in ("softmax", "argmax", "argmin", "sigma", "lambda", "theta")]
+    return len(long_words) >= 3
+
+
+def formula_to_latex(page, words, number_words):
+    """LaTeX for a display formula, or None when the result would be unreliable (the caller then keeps the plain symbols)."""
+    try:
+        latex = equation_latex(page, words, number_words).strip()
+    except Exception:
+        return None
+    if not latex or not latex.isascii() or latex.count("{") != latex.count("}") or "_{}" in latex or "^{}" in latex:
+        return None
+    if any(len(name) > 12 for name in re.findall(r"\\operatorname\{([^}]*)\}", latex)):
+        return None  # a long upright run is prose that was mistaken for a formula
+    if re.search(r"\\frac\{\}|\{\}", latex):
+        return None
+    if re.search(r"(?:(?<![\\\w])[A-Za-z] ){5,}", latex + " ") or re.search(r"[_^]\{ ?[=+\-]", latex):
+        return None  # scattered single letters or a script that starts with an operator: the layout was misread
+    return latex
+
+
+def page_to_markdown(page, words, drop_margin=()):
+    margin = page.height * 0.11
+    words = [w for w in words if not ((w["bottom"] < margin or w["top"] > page.height - margin)
+                                      and _in_drop(page, w, drop_margin, words))]
+    if not words:
+        return "", False
+    body_size = Counter(round(w["size"]) for w in words).most_common(1)[0][0]
+    blocks, two_col = column_blocks(page, words)
+    out = []
+
+    for lines in blocks:
+        facts = [_line_facts(line) for line in lines]
+        facts = [f for f in facts if f["text"]]
+        groups = _equation_groups(facts, body_size)
+        start_of = {g[0]: g for g in groups}
+        in_equation = {i for g in groups for i in g}
+        paragraph = []
+
+        def end_paragraph():
+            nonlocal paragraph
+            if paragraph:
+                text = paragraph[0]
+                for nxt in paragraph[1:]:
+                    text = text[:-1] + nxt if (text.endswith("-") and nxt[:1].islower() and len(text) > 2 and text[-2].isalpha()) else text + " " + nxt
+                out.append(text)
+            paragraph = []
+
+        last_bottom = None
+        for i, f in enumerate(facts):
+            if i in start_of:
+                end_paragraph()
+                members = start_of[i]
+                column_x0 = min(g["x0"] for g in facts)
+                column_width = max(max(g["x1"] for g in facts) - column_x0, 1)
+                number, parts, kept_words, number_words = None, [], [], []
+                for k in members:
+                    kept = []
+                    for w in facts[k]["words"]:
+                        if re.fullmatch(r"\(\d{1,3}\)", w["text"]) and w["x0"] > column_x0 + 0.55 * column_width and number is None:
+                            number = w["text"][1:-1]
+                            number_words.append(w)
+                        else:
+                            kept.append(w)
+                    kept_words += kept
+                    if kept:
+                        parts.append(clean_math(line_text(kept)).strip())
+                body = " ".join(p for p in parts if p)
+                if looks_like_prose(body):
+                    # not a formula after all: ordinary text that happens to contain symbols
+                    for p in parts:
+                        paragraph.append(p)
+                    last_bottom = facts[members[-1]]["bottom"]
+                    continue
+                latex = formula_to_latex(page, kept_words, number_words)
+                out.append(f"$$ {latex or body} $$" + (f"  *({number})*" if number else ""))
+                last_bottom = facts[members[-1]]["bottom"]
+                continue
+            if i in in_equation:
+                continue
+            text, size, bold = f["text"], f["size"], f["bold"]
+            height = f["bottom"] - f["top"]
+            gap = (f["top"] - last_bottom) if last_bottom is not None else 0
+            if re.match(r"^(Figure|Fig\.|Table|Algorithm)\s*\d+", text):
+                end_paragraph()
+                out.append(text)
+            elif size > body_size + 3 and len(text) < 140:
+                end_paragraph()
+                mark = "# " if size > body_size + 6 else "## "
+                if out and out[-1].startswith(mark) and last_bottom is not None and gap < height * 1.6:
+                    out[-1] += " " + text
+                else:
+                    out.append(mark + text)
+            elif re.match(r"^(\d{1,2}[.)]|[•▪◦●\-–])\s+\S", text):
+                end_paragraph()
+                paragraph.append(text)  # a list item starts its own paragraph
+            elif bold and len(text) < 80 and re.match(r"^(\d+(\.\d+)*\s+)?[A-Z]", text):
+                end_paragraph()
+                mark = "### " if re.match(r"^\d+\.\d+", text) else "## "
+                out.append(mark + text)
+            else:
+                if paragraph and gap > height * 0.9:
+                    end_paragraph()
+                paragraph.append(text)
+            last_bottom = f["bottom"]
+        end_paragraph()
+    return "\n\n".join(out), two_col
+
+
+def _in_drop(page, word, drop_margin, words):
+    line_words = [w for w in words if abs((w["top"] + w["bottom"]) / 2 - (word["top"] + word["bottom"]) / 2) <= 3.5]
+    text = " ".join(re.sub(r"\d+", "#", line_text(sorted(line_words, key=lambda w: w["x0"]))).split()[:4])
+    return text in drop_margin
+
+
+def convert_with_markitdown(file_path):
+    """Markdown from MarkItDown. For two-column papers MarkItDown mixes the columns and loses word
+    spacing, so those PDFs are read column by column instead, with formulas as $$ blocks."""
+    from markitdown import MarkItDown
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(str(file_path)) as pdf:
+            pages = pdf.pages[:40]
+            page_list = [page_words(p, [tuple(b) for b in find_figure_regions(p)]) for p in pages]
+            two_col = sum(1 for p, w in zip(pages, page_list) if find_gutters(w, p.width))
+            if two_col and two_col * 2 >= sum(1 for w in page_list if w):
+                counts = Counter(t for p, w in zip(pages, page_list) for t in set(margin_lines(p, w)))
+                repeated = {t for t, n in counts.items() if n >= 2 and len(pages) > 1}
+                parts = [page_to_markdown(p, w, repeated)[0] for p, w in zip(pages, page_list)]
+                text = "\n\n".join(part for part in parts if part)
+                if text.strip():
+                    return text
+            else:
+                # one column: the reader is only worth using when the paper has display formulas,
+                # which plain MarkItDown turns into scrambled symbols
+                counts = Counter(t for p, w in zip(pages, page_list) for t in set(margin_lines(p, w)))
+                repeated = {t for t, n in counts.items() if n >= 2 and len(pages) > 1}
+                parts = [page_to_markdown(p, w, repeated)[0] for p, w in zip(pages, page_list)]
+                text = "\n\n".join(part for part in parts if part)
+                if text.count("$$") >= 4:
+                    return text
+    except Exception:
+        pass  # fall back to MarkItDown's own output
+    return MarkItDown().convert(str(file_path)).text_content
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         return convert_with_docling(file_path)
     elif tool == "markitdown":
-        from markitdown import MarkItDown
-        converter = MarkItDown()
-        result = converter.convert(str(file_path))
-        return result.text_content
+        return convert_with_markitdown(file_path)
     elif tool == "pypdf":
         return convert_with_pypdf(file_path)
     elif tool == "pdfplumber":
@@ -677,7 +1383,7 @@ def find_caption_tables(page, max_rule_gap=70):
     boxes = []
     for i, caption in enumerate(captions):
         limit = captions[i + 1]["top"] if i + 1 < len(captions) else page.height
-        below = [r for r in rules if caption["bottom"] - 2 <= r["top"] < limit - 2]
+        below = [r for r in rules if caption["bottom"] - 6 <= r["top"] < limit - 2]
         if not below or below[0]["top"] - caption["bottom"] > 45:
             continue
         group = [below[0]]
@@ -736,7 +1442,7 @@ def extract_page_tables(page, figures):
             continue  # already found as a ruled table
         if any(overlap_share(box, f) > 0.5 for f in figures):
             continue
-        rows = page.crop(box).extract_table({
+        rows = page.within_bbox(box).extract_table({
             "vertical_strategy": "text",
             "horizontal_strategy": "text",
             "text_x_tolerance": 3,
