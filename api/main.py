@@ -497,13 +497,27 @@ def column_blocks(page, words):
                     return True
         return False
 
+    column_width = (page.width - 2 * min(w["x0"] for w in words)) / (len(gutters) + 1.2)
+    # on the first page the author block sits above the body: names, e-mails and affiliations side by side.
+    # Those rows are kept together (left author, then right author) instead of waiting for the end of the column.
+    banner = page.page_number == 1
+
     for line in all_lines:
         if full_width(line):
             flush()
             blocks.append([line])
-        else:
+            continue
+        if banner:
+            sides = {}
             for w in line:
-                bands[column_of(w)].append(w)
+                sides.setdefault(column_of(w), []).append(w)
+            wide = any(max(x["x1"] for x in ws) - min(x["x0"] for x in ws) > 0.8 * column_width for ws in sides.values())
+            heading = any(re.match(r"^(abstract\b|keywords?\b|index terms|\d{1,2}\.?\s+[A-Z]|[IVX]+\.\s+[A-Z])", line_text(ws), re.I) for ws in sides.values())
+            if len(sides) < len(gutters) + 1 or wide or heading:
+                flush()
+                banner = False
+        for w in line:
+            bands[column_of(w)].append(w)
     flush()
     return blocks, True
 
