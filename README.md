@@ -63,8 +63,7 @@ flowchart LR
     A -->|PDF| T1 & T2 & T3 & T4 & T5
     A -->|web page URL| T6
     A -->|web page URL| T4
-    T1 & T2 & T3 & T4 & T5 & T6 -->|Markdown, text, tables, images| R[Research paper layout, LaTeX formulas, italic headers and footers, image links]
-    R --> B[(AWS S3)]
+    T1 & T2 & T3 & T4 & T5 & T6 -->|Markdown, text, tables, images| B[(AWS S3)]
     A -->|S3 keys + previews| S
     S -->|result displayed| U
 ```
