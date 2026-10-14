@@ -1766,11 +1766,143 @@ def recognize_docling_formulas(text, file_path):
     return FORMULA_PLACEHOLDER.sub("", text)
 
 
+def _anchor_position(block_letters, reader_letters):
+    """Where a block of Docling's text sits in the column reader's text, or -1 when it cannot be found."""
+    n = len(block_letters)
+    if n < 12:
+        return -1
+    for start in (0, max(0, n // 2 - 12), max(0, n - 24)):
+        piece = block_letters[start:start + 24]
+        if len(piece) < 12:
+            continue
+        found = reader_letters.find(piece)
+        if found >= 0:
+            return found - start
+    return -1
+
+
+def order_docling_like_reader(text, reader):
+    """Put Docling's blocks in the column reader's order (left column, then right column), put each
+    heading where the reader has it, list every author on a line of their own, and italicize the page
+    headers and footers.
+
+    Docling sometimes reads the right column before the left one, misplaces headings (Abstract,
+    Introduction) and runs the authors together in one paragraph. The column reader reads the same page
+    by its true layout, so each Docling block is found in the reader's text and the blocks are sorted by
+    where they sit there."""
+    if not reader or not text.strip():
+        return text
+    italic_words = set()
+    for line in re.findall(r"(?m)^\*([^\n]*)\*\s*$", reader):
+        italic_words.update(w.lower() for w in re.findall(r"[A-Za-z0-9]{3,}", line))
+    body = re.sub(r"(?m)^\*[^\n]*\*\s*$", "", reader)
+    reader_blocks = [b for b in re.split(r"\n\s*\n", body) if b.strip()]
+    reader_letters, exact, offset = "", {}, 0
+    for block in reader_blocks:
+        letters = _letters(block)
+        exact.setdefault(letters, offset)
+        reader_letters += letters
+        offset += len(letters)
+
+    blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
+    keys, last = [], 0.0
+    for index, block in enumerate(blocks):
+        letters = _letters(block)
+        if (block.lstrip().startswith("#") or len(letters) < 12) and letters in exact:
+            pos = exact[letters]  # a heading goes where the reader has the same heading
+        else:
+            pos = _anchor_position(letters, reader_letters)
+        if pos >= 0:
+            last = float(pos)
+            keys.append((last, 0, index))
+        else:
+            keys.append((last, 1, index))  # no match: stays right behind the block before it
+    blocks = [blocks[k[2]] for k in sorted(keys)]
+
+    # authors: one paragraph each, as the reader has them, right under the title
+    author_blocks = []
+    for block in reader_blocks:
+        if re.match(r"(?i)\s*(#+\s*)?(\*\*)?abstract", block):
+            break
+        if not block.lstrip().startswith("#"):
+            author_blocks.append(block.strip())
+        if len(author_blocks) > 12:
+            break
+    else:
+        author_blocks = []
+    if author_blocks and len(author_blocks) <= 12:
+        blob = "".join(_letters(b) for b in author_blocks)
+        blocks = [b for b in blocks if not (6 <= len(_letters(b)) and _letters(b) in blob)]
+        title_at = next((i for i, b in enumerate(blocks) if b.lstrip().startswith("#")), -1)
+        blocks[title_at + 1:title_at + 1] = author_blocks
+
+    # running headers and footers: short blocks whose words all come from the reader's italic lines
+    if italic_words:
+        for i, block in enumerate(blocks):
+            plain = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", block)
+            words = [w.lower() for w in re.findall(r"[A-Za-z0-9]{3,}", plain)]
+            if (block.lstrip().startswith(("#", "!", "$", "*", "|", "-")) or len(words) < 2 or len(words) > 40):
+                continue
+            if sum(w in italic_words for w in words) >= 0.9 * len(words):
+                blocks[i] = "*" + block.strip().replace("\n", " ") + "*"
+
+    # Docling drops running headers and footers on most pages; the reader has them, so the ones Docling
+    # left out are put back, each at the top (header) or bottom (footer) of its page
+    def words_of(line):
+        return {w.lower() for w in re.findall(r"[A-Za-z0-9]{3,}", re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line))}
+
+    have = [(i, words_of(b)) for i, b in enumerate(blocks)
+            if len(b) > 2 and b.startswith("*") and b.endswith("*") and not b.startswith("**")]
+    used = set()
+    dl_letters = [_letters(b) for b in blocks]
+    inserts, pending = {}, []
+    for block in re.split(r"\n\s*\n", reader):
+        if not block.strip():
+            continue
+        if block.lstrip().startswith("*") and not block.lstrip().startswith("**"):
+            for line in block.splitlines():
+                line = line.strip()
+                if len(line) < 4 or not (line.startswith("*") and line.rstrip("*") != line):
+                    continue
+                words = words_of(line)
+                match = None
+                for i, w in have:
+                    if i in used or not w or not words:
+                        continue
+                    if len(w & words) / len(w | words) >= 0.8:
+                        match = i
+                        break
+                if match is not None:
+                    used.add(match)
+                else:
+                    pending.append(line)
+            continue
+        if pending:
+            letters = _letters(block)
+            if len(letters) >= 12:
+                at = next((i for i, d in enumerate(dl_letters) if letters[:24] in d), None)
+                if at is not None:
+                    inserts.setdefault(at, []).extend(pending)
+                    pending = []
+    if inserts or pending:
+        result = []
+        for i, b in enumerate(blocks):
+            result.extend(inserts.get(i, []))
+            result.append(b)
+        result.extend(pending)
+        blocks = result
+    return "\n\n".join(blocks)
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         text = convert_with_docling(file_path)
         # Docling leaves "<!-- image -->" where a picture was; the real image links are placed separately
         text = re.sub(r"[ \t]*<!--\s*image\s*-->[ \t]*\n?", "", text)
+        try:
+            text = order_docling_like_reader(text, read_pdf_with_reader(file_path))
+        except Exception:
+            pass  # keep Docling's own order
         text = recognize_docling_formulas(text, file_path)
         return re.sub(r"\n{3,}", "\n\n", text)
     elif tool == "markitdown":
