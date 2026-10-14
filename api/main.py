@@ -228,11 +228,29 @@ def pypdf_page_markdown(text, page, repeated):
                 return [first] + rest
         return None
 
+    # words that sit inside a figure: pypdf prints them as loose lines, but they belong to the image
+    try:
+        figure_boxes = find_figure_regions(page)
+    except Exception:
+        figure_boxes = []
+    figure_tokens = set()
+    if figure_boxes:
+        for w in page.extract_words():
+            if char_in_boxes(w, figure_boxes):
+                figure_tokens.add(_letters(w["text"]))
+        figure_tokens.discard("")
+
+    def only_figure_text(line):
+        tokens = [_letters(t) for t in re.split(r"\s+", line) if _letters(t)]
+        return bool(tokens) and all(t in figure_tokens or t.isdigit() for t in tokens)
+
     todo = []
     for raw in text.split("\n"):
         line = raw.strip()
         key = _letters(line)
         if not key:
+            continue
+        if figure_tokens and key not in layout and only_figure_text(line):
             continue
         if key not in layout and key not in header_keys and key not in footer_keys:
             pieces = split_glued(key)
@@ -327,6 +345,12 @@ def convert_with_pypdf(file_path):
     return result
 
 
+def char_in_boxes(obj, boxes):
+    """True when the middle of a character or word lies inside one of the boxes (x0, top, x1, bottom)."""
+    cx, cy = (obj["x0"] + obj["x1"]) / 2, (obj["top"] + obj["bottom"]) / 2
+    return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
+
+
 def convert_with_pdfplumber(file_path):
     """Text from pdfplumber, with each table shown as a Markdown table."""
     import pdfplumber
@@ -334,9 +358,15 @@ def convert_with_pdfplumber(file_path):
     parts = []
     with pdfplumber.open(str(file_path)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            text = (page.extract_text() or "").strip()
             try:
-                tables = extract_page_tables(page, find_figure_regions(page))
+                figures = find_figure_regions(page)
+            except Exception:
+                figures = []
+            # text printed inside a figure (axis labels, legends) stays in the image; only the image link is wanted
+            visible = page.filter(lambda obj: not (obj.get("object_type") == "char" and char_in_boxes(obj, figures))) if figures else page
+            text = (visible.extract_text() or "").strip()
+            try:
+                tables = extract_page_tables(page, figures)
                 text = put_tables_in_text(text, tables)
             except Exception:
                 pass  # keep the page text even if table detection fails
