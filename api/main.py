@@ -1367,6 +1367,69 @@ def find_figure_regions(page):
     return regions
 
 
+def split_unlabeled_panels(page, box):
+    """Panels with no (a), (b) labels: split the figure where a clear empty vertical strip runs through all of it.
+
+    Returns a list of (letter, box), or [] when the figure is one piece."""
+    x0, top, x1, bottom = box
+    width = x1 - x0
+    spans = []
+    for kind in ("rect", "curve", "line", "image", "char"):
+        for obj in page.objects.get(kind, []):
+            if obj["bottom"] >= top and obj["top"] <= bottom and obj["x1"] > x0 and obj["x0"] < x1:
+                if obj["x1"] - obj["x0"] > 0.6 * width:
+                    continue  # a frame or background behind the whole figure
+                spans.append((max(obj["x0"], x0), min(obj["x1"], x1)))
+    if len(spans) < 10:
+        return split_raster_panels(page, box)
+    spans.sort()
+    gaps, edge = [], x0
+    for s0, s1 in spans:
+        if s0 > edge:
+            gaps.append((edge, s0))
+        edge = max(edge, s1)
+    # a split needs a real gap with a substantial drawing on both sides
+    cuts = [(g1 - g0, (g0 + g1) / 2) for g0, g1 in gaps
+            if g1 - g0 >= 8 and (g0 - x0) >= 0.25 * width and (x1 - g1) >= 0.25 * width]
+    if not cuts:
+        return split_raster_panels(page, box)
+    cut = max(cuts)[1]
+    return [("a", (x0, top, cut, bottom)), ("b", (cut, top, x1, bottom))]
+
+
+def split_raster_panels(page, box):
+    """A figure stored as one picture that holds two plots side by side: look for a clear white vertical strip."""
+    try:
+        x0, top, x1, bottom = box
+        scale = 100 / 72
+        image = page.to_image(resolution=100).original.convert("L")
+        crop = image.crop((int(x0 * scale), int(top * scale), int(x1 * scale), int(bottom * scale)))
+        width, height = crop.size
+        if width < 200 or height < 60:
+            return []
+        pixels = crop.load()
+        rows = range(0, height, 2)
+        white = []
+        for x in range(width):
+            dark = sum(1 for y in rows if pixels[x, y] < 235)
+            white.append(dark <= 0.01 * len(rows))
+        best, start = None, None
+        for x, is_white in enumerate(white + [False]):
+            if is_white and start is None:
+                start = x
+            elif not is_white and start is not None:
+                run = x - start
+                if run >= 5 and start >= 0.25 * width and x <= 0.75 * width and (best is None or run > best[0]):
+                    best = (run, (start + x) / 2)
+                start = None
+        if not best:
+            return []
+        cut = x0 + best[1] / scale
+        return [("a", (x0, top, cut, bottom)), ("b", (cut, top, x1, bottom))]
+    except Exception:
+        return []
+
+
 def split_panels(page, box):
     """Split a figure into its labelled panels, such as (a), (b), (c) printed under it.
 
@@ -1382,7 +1445,7 @@ def split_panels(page, box):
             labels.append((cx, match.group(1).lower(), w["bottom"]))
     labels.sort()
     if len(labels) < 2 or len({letter for _, letter, _ in labels}) != len(labels):
-        return []
+        return split_unlabeled_panels(page, box)
 
     # Include the (a), (b), (c) labels themselves at the bottom of each panel
     bottom = max(bottom, max(label_bottom for _, _, label_bottom in labels) + 4)
