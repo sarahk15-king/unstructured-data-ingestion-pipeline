@@ -475,6 +475,26 @@ def convert_with_pdfplumber(file_path):
     return result
 
 
+def looks_like_text_box(rows):
+    """True for a ruled box around text rather than a real table: an algorithm listing (a title, then
+    'Require:' or numbered lines), or any box where every column of a row repeats the same text."""
+    flat = [c for row in rows for c in row if c]
+    if not flat:
+        return False
+    first = " ".join(c for c in rows[0] if c)
+    keywords = re.compile(r"^(Require|Input|Output|Ensure|Initialize|Procedure)\b", re.I)
+    if re.match(r"^(Algorithm|Listing|Pseudocode)\b", first, re.I) or any(keywords.match(c) for c in flat):
+        return True
+    numbered = sum(1 for row in rows if row and re.match(r"^\d{1,2}[:.]?(\s|$)", row[0] or ""))
+    if numbered >= 3 and numbered >= 0.6 * len(rows):
+        return True
+    single = 0
+    for row in rows:
+        values = [v for v in dict.fromkeys(row) if v]
+        single += 1 if len(values) <= 1 else 0
+    return single == len(rows)
+
+
 def html_tables_to_markdown(text):
     """Azure writes tables as HTML. Turn each <table> into a Markdown table (the caption goes above it)."""
     if "<table" not in text.lower():
@@ -513,11 +533,30 @@ def html_tables_to_markdown(text):
                 rows.append(row)
         if not rows:
             return match.group(0)
+        # a box drawn around text (an algorithm listing, say) is not a table: print its lines as text
+        if looks_like_text_box(rows):
+            return "  \n".join(" ".join(dict.fromkeys(c for c in row if c)) for row in rows if any(row))
         caption = table.find("caption")
         title = f"{caption.get_text(' ', strip=True)}\n\n" if caption else ""
         return title + rows_to_markdown(rows)
 
     return re.sub(r"<table\b.*?</table>", convert, text, flags=re.IGNORECASE | re.DOTALL)
+
+
+def pipe_text_boxes_to_text(text):
+    """A Markdown table that is really a box of text (an algorithm listing) is printed as lines."""
+    def convert(match):
+        rows = []
+        for line in match.group(0).strip().split("\n"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if all(re.fullmatch(r":?-{3,}:?", c) or not c for c in cells):
+                continue
+            rows.append(cells)
+        if rows and looks_like_text_box(rows):
+            return "  \n".join(" ".join(dict.fromkeys(c for c in row if c)) for row in rows if any(row)) + "\n"
+        return match.group(0)
+
+    return re.sub(r"(?m)(?:^\|.*\|[ \t]*\n?)+", convert, text)
 
 
 def clean_azure_markdown(text):
@@ -529,9 +568,70 @@ def clean_azure_markdown(text):
 
     text = re.sub(r"<figure\b.*?</figure>", figure, text, flags=re.IGNORECASE | re.DOTALL)
     text = html_tables_to_markdown(text)
+    text = pipe_text_boxes_to_text(text)
     text = italic_page_margins(text)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def reflow_paragraphs(text):
+    """Azure keeps the printed line breaks. Lines of one paragraph are joined again, and a word split
+    across two lines by a hyphen is made whole."""
+    blocks = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [l for l in block.split("\n") if l.strip()]
+        plain = lines and len(lines) > 1 and not any(
+            re.match(r"^\s*(#|\||<|!\[|>|\$\$|\*|[-+]\s|\d+[.)]\s|[•▪◦●])", l) or l.endswith("  ") for l in lines)
+        if not plain:
+            blocks.append(block.strip("\n"))
+            continue
+        joined = lines[0].strip()
+        for nxt in lines[1:]:
+            nxt = nxt.strip()
+            if joined.endswith("-") and nxt[:1].islower() and len(joined) > 2 and joined[-2].isalpha():
+                joined = joined[:-1] + nxt  # a word split across two lines becomes one word
+            else:
+                joined += " " + nxt
+        blocks.append(joined)
+    cleaned = []
+    for block in blocks:
+        if not block:
+            continue
+        # a caption printed twice (once as text, once as the first line of the box under it)
+        if cleaned and block.startswith(cleaned[-1].strip() + "  \n"):
+            block = block[len(cleaned[-1].strip()) + 3:]
+        cleaned.append(block)
+    return "\n\n".join(cleaned)
+
+
+def bold_headings(text):
+    """Headings are printed in bold: '## Abstract' becomes '## **Abstract**'."""
+    def bold(match):
+        title = match.group(2).strip()
+        if not title or title.startswith("**"):
+            return match.group(0)
+        return f"{match.group(1)} **{title}**"
+    return re.sub(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$", bold, text)
+
+
+def italicize_margin_lines(text, reader_text):
+    """Headers, footers and page numbers that Azure printed as ordinary text are set in italics.
+    They are recognised by matching the lines the column reader found in the margins."""
+    margin_keys = set()
+    for line in re.findall(r"(?m)^\*(?!\*)(.+?)\*\s*$", reader_text):
+        key = _letters(line.replace("\\*", "*"))
+        if len(key) >= 3:
+            margin_keys.add(key)
+    if not margin_keys:
+        return text
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("*") or stripped.startswith("#") or not stripped:
+            continue
+        if _letters(stripped) in margin_keys:
+            lines[i] = "*" + stripped.replace("*", "\\*") + "*"
+    return "\n".join(lines)
 
 
 AZURE_MARGIN = re.compile(r'<!--\s*(PageHeader|PageFooter|PageNumber)\s*=\s*"(.*?)"\s*-->', re.DOTALL)
@@ -568,6 +668,53 @@ def author_block(reader_text):
     return []
 
 
+def _is_math_symbol(ch):
+    """Greek letters, maths italic letters and maths operators."""
+    code = ord(ch)
+    return 0x370 <= code <= 0x3FF or 0x1D400 <= code <= 0x1D7FF or 0x2190 <= code <= 0x22FF or ch in "ℝℕℤℚℂ"
+
+
+def _word_spans(text):
+    """Words with their positions, skipping formula blocks and Markdown marks."""
+    words, offset = [], 0
+    for line in text.split("\n"):
+        if not line.lstrip().startswith("$$"):
+            for match in re.finditer(r"\S+", line):
+                token = match.group(0).strip("*#|`")
+                if token and not set(token) <= set("-:"):
+                    words.append((token, offset + match.start(), offset + match.end()))
+        offset += len(line) + 1
+    return words
+
+
+def repair_symbols(text, reader_text):
+    """Azure often reads a Greek letter or maths symbol as a look-alike letter (tau as 't', xi as '5').
+    The words of Azure's text are lined up with the words the column reader read from the PDF's own
+    text layer, and where they differ at a symbol, the paper's own symbols are put back."""
+    import difflib
+
+    reader_lines = [l for l in reader_text.split("\n") if not l.lstrip().startswith("*")]
+    azure_words = _word_spans(text)
+    reader_words = [w for w in _word_spans("\n".join(reader_lines))]
+    if not azure_words or not reader_words:
+        return text
+    matcher = difflib.SequenceMatcher(None, [w[0] for w in azure_words], [w[0] for w in reader_words], autojunk=False)
+    edits = []
+    for tag, a0, a1, b0, b1 in matcher.get_opcodes():
+        if tag != "replace" or a1 - a0 > 4 or b1 - b0 > 4:
+            continue
+        reader_span = [w[0] for w in reader_words[b0:b1]]
+        azure_span = [w[0] for w in azure_words[a0:a1]]
+        has_symbol = any(_is_math_symbol(ch) for token in reader_span for ch in token)
+        short = len("".join(azure_span)) <= 14 and not any(_is_math_symbol(ch) for token in azure_span for ch in token)
+        if has_symbol and short:
+            edits.append((azure_words[a0][1], azure_words[a1 - 1][2], " ".join(reader_span)))
+    for start, end, replacement in sorted(edits, reverse=True):
+        # keep punctuation that follows the word in Azure's text
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def fix_azure_authors(text, file_path):
     """Azure reads a two-column title block column by column, so the second author lands after the
     Introduction. All authors are put right under the title, as printed, and the stray copies are removed."""
@@ -579,7 +726,7 @@ def fix_azure_authors(text, file_path):
     abstract = next((i for i, p in enumerate(paragraphs) if re.match(r"^#*\s*\**abstract\**\s*$", p.strip(), re.I)), None)
     if abstract is None:
         return text
-    title_end = max([i for i, p in enumerate(paragraphs[:abstract]) if p.lstrip().startswith("# ")], default=-1)
+    title_end = max([i for i, p in enumerate(paragraphs[:abstract]) if p.lstrip().startswith("#")], default=-1)
     block_letters = _letters(" ".join(authors))
     keep_front = [p for p in paragraphs[:title_end + 1]]
     # anything between the title and "Abstract" that is not an author line stays (such as a venue line)
@@ -652,9 +799,12 @@ def convert_with_azure(file_path):
     markdown = "\n\n".join(parts)
     try:
         markdown = fix_azure_authors(markdown, file_path)
+        markdown = italicize_margin_lines(markdown, read_pdf_with_reader(file_path))
         markdown = recognize_docling_formulas(markdown, file_path)
+        markdown = repair_symbols(markdown, read_pdf_with_reader(file_path))
     except Exception:
         pass  # keep Azure's own text if the extra steps fail
+    markdown = bold_headings(reflow_paragraphs(markdown))
     if total_pages > AZURE_MAX_PAGES:
         markdown += f"\n\n> Only the first {AZURE_MAX_PAGES} of {total_pages} pages were sent to Azure."
     return markdown
@@ -1542,10 +1692,14 @@ def reader_formulas(reader_text):
     return [("\n\n".join(g["blocks"]), g["before"], g["after"]) for g in groups]
 
 
+MATH_GARBLE = re.compile(r"[()=/+\-*^_|∑∏√∫<>≤≥≈{}\[\]]")
+
+
 def find_formula_region(raw, letters, positions, before, after, start_at):
-    """Where in Docling's (or pypdf's) text a formula belongs: the stretch between the words before it and
-    the words after it. The few letters next to the formula may be its own scrambled symbols, so shorter
-    versions of both are tried as well.
+    """Where in Docling's (or pypdf's, or Azure's) text a formula belongs: the stretch between the words
+    before it and the words after it. The few letters next to the formula may be its own scrambled
+    symbols, so shorter versions of both are tried as well; letters that were skipped that way are only
+    removed when they look like scrambled maths, so real words next to the formula are never lost.
 
     Returns (start, end, next search position), or None."""
     for trim_before in (0, 6, 12, 18):
@@ -1557,13 +1711,31 @@ def find_formula_region(raw, letters, positions, before, after, start_at):
         if a < 0:
             continue
         a_end = a + len(context)
+        start = positions[a_end - 1] + 1
+        if trim_before:
+            # the skipped letters follow the matched words: keep them unless they look like maths
+            skipped_end = min(a_end + trim_before, len(positions)) - 1
+            span = raw[start:positions[skipped_end] + 1]
+            if not MATH_GARBLE.search(span):
+                start = positions[skipped_end] + 1
+                while start < len(raw) and raw[start].isalnum():
+                    start += 1  # finish the word, so no word is cut in the middle
         for trim_after in (0, 6, 12, 18):
             following = after[trim_after:trim_after + 30]
             if len(following) < 10:
                 break
             b = letters.find(following, a_end)
             if b >= 0 and b - a_end <= 250 + trim_before + trim_after:
-                return positions[a_end - 1] + 1, positions[b], a_end
+                end = positions[b]
+                if trim_after and b - trim_after >= a_end:
+                    span = raw[positions[b - trim_after]:end]
+                    if not MATH_GARBLE.search(span):
+                        end = positions[b - trim_after]  # the skipped words are real text: keep them
+                        while end > start and raw[end - 1].isalnum():
+                            end -= 1  # back up to the start of the word, so no word loses its first letters
+                if end < start:
+                    continue
+                return start, end, a_end
     return None
 
 
