@@ -1158,7 +1158,10 @@ def convert_with_markitdown(file_path):
 
 def convert_pdf(file_path, tool):
     if tool == "docling":
-        return convert_with_docling(file_path)
+        text = convert_with_docling(file_path)
+        # Docling leaves "<!-- image -->" where a picture was; the real image links are placed separately
+        text = re.sub(r"[ \t]*<!--\s*image\s*-->[ \t]*\n?", "", text)
+        return re.sub(r"\n{3,}", "\n\n", text)
     elif tool == "markitdown":
         return convert_with_markitdown(file_path)
     elif tool == "pypdf":
