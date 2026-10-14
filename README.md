@@ -29,26 +29,51 @@ A pipeline that converts unstructured documents (PDFs and web pages) into clean 
 4. Tables are written as Markdown tables. Each image link is placed in the Markdown at the position of the picture, above its "Figure N" caption. Any image that cannot be placed is listed in an **Extracted images** section at the end.
 5. Everything is uploaded to S3 with metadata tags (source, tool, date, type). The app shows the S3 locations, a preview of each table and a Markdown preview, and lets you download the Markdown.
 
+## Research papers
+
+The app can handle research papers, including two- and three-column layouts. All six PDF tools give the same kind of Markdown:
+
+- **Reading order:** the left column is read before the right column.
+- **Title and authors:** every author is listed under the title, one below the other.
+- **Headings:** shown as Markdown headings, such as Abstract and Introduction.
+- **Formulas:** written as LaTeX, with fractions, sums, roots, subscripts, superscripts and Greek letters.
+- **Headers and footers:** written in italics, headers at the top of the page and footers at the bottom.
+- **Whole words:** no word is split across two lines.
+- **Images:** only the image link is written, not the text inside the figure. Figures with several panels are saved as whole figures and as separate panels.
+- **Text boxes:** an algorithm or other boxed text is written as text, not as a table.
+- **Symbols:** Greek letters and math symbols are read correctly in Azure's output too.
+
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U[User] -->|upload PDF or URL| S[Streamlit Frontend]
+    U[User] -->|upload PDF or URL, pick a tool| S[Streamlit Frontend]
     S -->|POST /process-pdf or /process-url| A[FastAPI Backend]
-    A -->|PDF| D{MarkItDown, pypdf, pdfplumber, Azure or Docling}
-    A -->|PDF| P[pdfplumber: text, tables, images]
-    A -->|URL| W[BeautifulSoup or Azure: text, tables, images]
-    D -->|Markdown| B[(AWS S3)]
-    P -->|text JSON, table CSVs, image PNGs| B
-    W -->|Markdown, text, tables, images| B
+
+    subgraph T[6 extraction tools]
+        direction TB
+        T1[MarkItDown]
+        T2[pypdf]
+        T3[pdfplumber]
+        T4[Azure Document Intelligence]
+        T5[Docling]
+        T6[BeautifulSoup]
+    end
+
+    A -->|PDF| T1 & T2 & T3 & T4 & T5
+    A -->|web page URL| T6
+    A -->|web page URL| T4
+    T1 & T2 & T3 & T4 & T5 & T6 -->|Markdown, text, tables, images| R[Research paper layout, LaTeX formulas, italic headers and footers, image links]
+    R --> B[(AWS S3)]
     A -->|S3 keys + previews| S
     S -->|result displayed| U
 ```
 
 How the pieces fit together:
 
-- **Extraction:** pdfplumber pulls the text, tables and images out of a PDF, and BeautifulSoup does the same for a web page. Enterprise services (Azure Document Intelligence, AWS Textract) were run separately for comparison.
-- **Standardization:** the tool chosen in the app (MarkItDown, pypdf, pdfplumber, Azure or Docling) converts a PDF into one Markdown file, with tables as Markdown tables and image links at the figures.
+- **Six tools:** MarkItDown, pypdf, pdfplumber, Azure Document Intelligence and Docling read PDFs, and BeautifulSoup reads web pages (Azure also reads web pages). The user picks the tool in the app.
+- **Extraction:** the chosen tool turns the PDF or web page into Markdown, and the text, each table and each image are also saved separately.
+- **Standardization:** whichever tool is used, the Markdown follows the same rules: columns in reading order, authors under the title, headings, LaTeX formulas, italic headers and footers, tables as Markdown tables and image links at the figures.
 - **Storage:** every output is uploaded to a private, encrypted S3 bucket under a fixed folder layout, with metadata tags.
 - **API:** FastAPI exposes `/process-pdf` and `/process-url`, runs the steps above, and returns the S3 locations and a preview.
 - **Front end:** Streamlit sends the upload or URL to the API and shows the results.
@@ -199,6 +224,8 @@ Every object carries metadata tags (source, tool, date, type, document name) so 
 - Azure's free tier reads only 2 pages per request, so the backend sends the PDF in 2-page chunks and stops at 12 pages.
 - The image links in the Markdown are `s3://` links to the private bucket, so a Markdown viewer will not show them as pictures. Pictures without a "Figure N" caption are placed at the end of their page for pypdf and pdfplumber, and at the end of the file for the other tools. Images from web pages are listed at the end.
 - Complex tables with merged cells may not become clean Markdown tables.
+- Docling sometimes joins a sentence that runs from one column into the next. That text comes from Docling itself and is not changed.
+- Formulas are rebuilt only for PDFs with a text layer. A scanned PDF has no characters to rebuild them from.
 
 ## Tech stack
 
