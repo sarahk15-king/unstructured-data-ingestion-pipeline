@@ -1,11 +1,12 @@
 """Turns raw Textract blocks into Markdown. Used by the API and by eval/textract_to_md.py.
 
-Textract gives lines, words and table cells with no headings, so none are invented here:
-each line is a paragraph, and each table becomes a Markdown table at the place where its
-first line appears in Textract's own order.
+Textract gives lines, words and table cells with no headings, so headings are found here from
+the line's size (Textract's box height) and its numbering. Every other line is a paragraph, and
+each table becomes a Markdown table at the place where its first line appears.
 """
 import json
-import sys
+import re
+import statistics
 from pathlib import Path
 
 
@@ -59,6 +60,29 @@ def markdown_table(rows):
     return "\n".join(lines)
 
 
+NUMBERED = re.compile(r"^(?:(\d+(?:\.\d+)*)\.?|([IVX]+)\.|([A-H])\.)\s+[A-Z]")
+NAMED = {"abstract", "references", "acknowledgments", "acknowledgements", "conclusion", "conclusions",
+         "introduction", "appendix", "bibliography"}
+
+
+def heading_level(text, height, body_height):
+    """1-6 if the line looks like a heading, else 0. Needs a short line that does not end like a sentence."""
+    words = text.split()
+    if not 1 <= len(words) <= 12 or text.endswith((".", ",", ";", ":")) or text.startswith(("Table", "Figure", "Fig.")):
+        return 0
+    bigger = body_height and height >= body_height * 1.15
+    m = NUMBERED.match(text)
+    if m and height >= body_height * 0.97:
+        if m.group(1):
+            return min(6, m.group(1).count(".") + 2)
+        return 2 if m.group(2) else 3
+    if text.lower().rstrip(":") in NAMED and height >= body_height * 0.97:
+        return 2
+    if bigger and len(words) >= 2 and not text.islower():
+        return 1
+    return 0
+
+
 def textract_to_markdown(blocks):
     by_id = {b["Id"]: b for b in blocks if "Id" in b}
     # which table does each word belong to?
@@ -68,6 +92,9 @@ def textract_to_markdown(blocks):
             for cell in children(block, by_id):
                 for word in children(cell, by_id):
                     word_table[word["Id"]] = block["Id"]
+    heights = [b["Geometry"]["BoundingBox"]["Height"] for b in blocks
+               if b.get("BlockType") == "LINE" and "Geometry" in b]
+    body_height = statistics.median(heights) if heights else 0
     out, done = [], set()
     for block in blocks:
         if block.get("BlockType") != "LINE":
@@ -84,7 +111,9 @@ def textract_to_markdown(blocks):
             continue
         text = block.get("Text", "").strip()
         if text:
-            out.append(text)
+            height = block.get("Geometry", {}).get("BoundingBox", {}).get("Height", 0)
+            level = heading_level(text, height, body_height) if body_height else 0
+            out.append(f"{'#' * level} {text}" if level else text)
     # tables whose words never showed up as a line still count
     for block in blocks:
         if block.get("BlockType") == "TABLE" and block["Id"] not in done:
