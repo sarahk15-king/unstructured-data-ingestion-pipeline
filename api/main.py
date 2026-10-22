@@ -821,9 +821,9 @@ def convert_with_textract(file_path):
     import time
 
     try:
-        from api.textract_md import textract_to_markdown
+        from api.textract_to_md import textract_to_markdown
     except ImportError:  # the server was started from inside the api folder
-        from textract_md import textract_to_markdown
+        from textract_to_md import textract_to_markdown
 
     if not BUCKET:
         raise HTTPException(status_code=503, detail="Textract needs the S3_BUCKET setting.")
