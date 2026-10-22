@@ -8,14 +8,7 @@ import streamlit as st
 # set the API_URL environment variable to http://localhost:8000 before starting the app.
 API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
 
-# Optional: a separate backend used only for Docling, for example a local backend shared
-# through a tunnel. Leave it unset to use API_URL for everything.
-DOCLING_API_URL = os.getenv("DOCLING_API_URL", "")
-
-# Docling needs more memory than Render's free tier has, so it only works against a local backend.
-DOCLING_AVAILABLE = bool(DOCLING_API_URL) or "localhost" in API_URL or "127.0.0.1" in API_URL
-
-TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling"}
+TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract"}
 
 st.set_page_config(page_title="Unstructured Data Ingestion Pipeline", layout="wide")
 st.title("Unstructured Data Ingestion Pipeline")
@@ -69,7 +62,7 @@ tab1, tab2 = st.tabs(["Upload PDF", "Submit URL"])
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
-    tool = st.selectbox("Conversion tool", ["markitdown", "pypdf", "pdfplumber", "azure", "docling"])
+    tool = st.selectbox("Conversion tool", ["markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"])
 
     if tool == "azure":
         st.info(
@@ -77,21 +70,24 @@ with tab1:
             "the first 2 pages of a PDF and files up to 4 MB."
         )
 
-    docling_unavailable = tool == "docling" and not DOCLING_AVAILABLE
-    if docling_unavailable:
-        st.warning(
-            "Docling is currently unavailable on this deployed app because the Render free tier "
-            "does not have enough memory to run it. To use it, run the backend and the app on your own "
-            "computer (see the README), or pick MarkItDown, pypdf or pdfplumber."
+    if tool == "textract":
+        st.info(
+            "Amazon Textract reads the text and finds tables. It does not return headings or formulas, "
+            "so the Markdown has no headings."
         )
 
-    if st.button("Process PDF", disabled=uploaded_file is None or docling_unavailable):
+    if tool == "docling":
+        st.info(
+            "Docling is slower than the other tools. The first run can take a few minutes while its "
+            "service wakes up, and large PDFs take longer."
+        )
+
+    if st.button("Process PDF", disabled=uploaded_file is None):
         with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             data = {"tool": tool}
             try:
-                backend = DOCLING_API_URL if tool == "docling" and DOCLING_API_URL else API_URL
-                response = requests.post(f"{backend.rstrip('/')}/process-pdf", files=files, data=data, timeout=600)
+                response = requests.post(f"{API_URL.rstrip('/')}/process-pdf", files=files, data=data, timeout=600)
                 response.raise_for_status()
                 st.session_state["pdf_result"] = response.json()
             except Exception as e:
