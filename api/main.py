@@ -848,7 +848,13 @@ def convert_with_textract(file_path):
             blocks.extend(result["Blocks"])
     finally:
         s3.delete_object(Bucket=BUCKET, Key=key)
-    return textract_to_markdown(blocks)
+    markdown = textract_to_markdown(blocks)
+    try:
+        # Textract cannot read equations, so the column reader's LaTeX formulas are put in their places
+        markdown = recognize_docling_formulas(markdown, file_path)
+    except Exception:
+        pass  # keep Textract's own text if this step fails
+    return bold_headings(markdown)
 
 
 _docling_converter = None
