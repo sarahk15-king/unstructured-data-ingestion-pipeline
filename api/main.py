@@ -608,7 +608,7 @@ def bold_headings(text):
     """Headings are printed in bold: '## Abstract' becomes '## **Abstract**'."""
     def bold(match):
         title = match.group(2).strip()
-        if not title or title.startswith("**"):
+        if not title or title.startswith("**") or re.fullmatch(r"Page \d+", title):
             return match.group(0)
         return f"{match.group(1)} **{title}**"
     return re.sub(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$", bold, text)
@@ -884,7 +884,7 @@ def tx_heading_level(text, height, body_height):
     return 0
 
 
-def tx_textract_to_markdown(blocks):
+def tx_textract_to_markdown(blocks, page_marks=False):
     by_id = {b["Id"]: b for b in blocks if "Id" in b}
     # which table does each word belong to?
     word_table = {}
@@ -896,10 +896,13 @@ def tx_textract_to_markdown(blocks):
     heights = [b["Geometry"]["BoundingBox"]["Height"] for b in blocks
                if b.get("BlockType") == "LINE" and "Geometry" in b]
     body_height = __import__('statistics').median(heights) if heights else 0
-    out, done = [], set()
+    out, done, last_page = [], set(), None
     for block in blocks:
         if block.get("BlockType") != "LINE":
             continue
+        if page_marks and block.get("Page") != last_page:
+            last_page = block.get("Page")
+            out.append(f"## Page {last_page}")  # lets place_images put a picture at the end of its page
         words = [w["Id"] for w in tx_children(block, by_id) if w["BlockType"] == "WORD"]
         tables = {word_table[w] for w in words if w in word_table}
         if tables and len(tables) == 1 and all(w in word_table for w in words):
@@ -990,7 +993,7 @@ def convert_with_textract(file_path):
         blocks = tx_drop_picture_text(blocks, file_path)
     except Exception:
         pass  # keep all of Textract's lines if the figures cannot be located
-    markdown = tx_textract_to_markdown(blocks)
+    markdown = tx_textract_to_markdown(blocks, page_marks=True)
     try:
         # Textract cannot read equations, so the column reader's LaTeX formulas are put in their places
         markdown = recognize_docling_formulas(markdown, file_path)
@@ -2696,6 +2699,10 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
     if tool == "markitdown":
         converted = fix_markdown_tables(converted, table_rows)
     markdown_text = place_images(converted, image_places)
+    if tool == "textract":
+        # the page marks were only there to place pictures, and every picture already sits at its own place
+        markdown_text = re.sub(r"(?m)^## Page \d+[ \t]*\n+", "", markdown_text)
+        markdown_text = re.sub(r"\n*## Extracted images\n.*\Z", "\n", markdown_text, flags=re.S)
     markdown_key = upload_result(doc_name, tool, markdown_text)
     uploaded["markdown"] = markdown_key
 
