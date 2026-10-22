@@ -1,4 +1,9 @@
-"""Turns raw Textract blocks into Markdown. Used by the API and by eval/textract_to_md.py.
+"""Turns raw Textract output into Markdown. The API imports it, and it also runs on its own:
+
+python api/textract_to_md.py outputs/textract eval/external/textract
+
+The command reads every *_textract.json in the first folder and writes <paper>.md files into the second,
+so the benchmark can score Textract.
 
 Textract gives lines, words and table cells with no headings, so headings are found here from
 the line's size (Textract's box height) and its numbering. Every other line is a paragraph, and
@@ -7,6 +12,7 @@ each table becomes a Markdown table at the place where its first line appears.
 import json
 import re
 import statistics
+import sys
 from pathlib import Path
 
 
@@ -121,3 +127,20 @@ def textract_to_markdown(blocks):
             if rows:
                 out.append(markdown_table(rows))
     return "\n\n".join(out) + "\n"
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(__doc__)
+        return
+    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    dst.mkdir(parents=True, exist_ok=True)
+    for path in sorted(src.glob("*_textract.json")):
+        paper = path.name[: -len("_textract.json")]
+        md = textract_to_markdown(load_blocks(path))
+        (dst / f"{paper}.md").write_text(md, encoding="utf-8")
+        print(f"{paper}: {md.count(chr(10))} lines written to {dst / (paper + '.md')}")
+
+
+if __name__ == "__main__":
+    main()
