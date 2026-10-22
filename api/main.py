@@ -82,7 +82,7 @@ def upload_table(key, name, rows, metadata):
     }
 
 
-PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber", "azure")
+PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber", "azure", "textract")
 URL_TOOLS = ("beautifulsoup", "azure", "pypdf", "pdfplumber")
 
 
@@ -808,6 +808,47 @@ def convert_with_azure(file_path):
     if total_pages > AZURE_MAX_PAGES:
         markdown += f"\n\n> Only the first {AZURE_MAX_PAGES} of {total_pages} pages were sent to Azure."
     return markdown
+
+
+TEXTRACT_MAX_WAIT = 300  # seconds to wait for Textract before giving up
+
+
+def convert_with_textract(file_path):
+    """Amazon Textract (tables feature): the PDF goes to S3, Textract reads it, the blocks become Markdown.
+
+    Textract returns lines and table cells only, so the Markdown has no headings.
+    """
+    import time
+
+    from api.textract_md import textract_to_markdown
+
+    if not BUCKET:
+        raise HTTPException(status_code=503, detail="Textract needs the S3_BUCKET setting.")
+    client = session.client("textract")
+    key = f"textract-input/{date.today().isoformat()}/{safe_name(Path(file_path).name)}"
+    s3.upload_file(str(file_path), BUCKET, key)
+    try:
+        job = client.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": BUCKET, "Name": key}}, FeatureTypes=["TABLES"]
+        )["JobId"]
+        waited = 0
+        while True:
+            result = client.get_document_analysis(JobId=job)
+            if result["JobStatus"] != "IN_PROGRESS":
+                break
+            if waited >= TEXTRACT_MAX_WAIT:
+                raise HTTPException(status_code=504, detail="Textract took too long on this PDF.")
+            time.sleep(2)
+            waited += 2
+        if result["JobStatus"] != "SUCCEEDED":
+            raise HTTPException(status_code=500, detail=f"Textract failed: {result.get('StatusMessage', result['JobStatus'])}")
+        blocks = list(result["Blocks"])
+        while result.get("NextToken"):
+            result = client.get_document_analysis(JobId=job, NextToken=result["NextToken"])
+            blocks.extend(result["Blocks"])
+    finally:
+        s3.delete_object(Bucket=BUCKET, Key=key)
+    return textract_to_markdown(blocks)
 
 
 _docling_converter = None
@@ -1913,6 +1954,8 @@ def convert_pdf(file_path, tool):
         return convert_with_pdfplumber(file_path)
     elif tool == "azure":
         return convert_with_azure(file_path)
+    elif tool == "textract":
+        return convert_with_textract(file_path)
     else:
         raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
