@@ -810,20 +810,129 @@ def convert_with_azure(file_path):
     return markdown
 
 
+# ---- Textract: raw blocks to Markdown (kept in this file so the deploy needs no extra module) ----
+def tx_load_blocks(path):
+    """The saved file can be a list of blocks, {"Blocks": [...]}, or a list of responses."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("Blocks", data.get("blocks", []))
+    blocks = []
+    for item in data:
+        if isinstance(item, dict) and "Blocks" in item:
+            blocks.extend(item["Blocks"])
+        else:
+            blocks.append(item)
+    return blocks
+
+
+def tx_children(block, by_id, kind="CHILD"):
+    for rel in block.get("Relationships", []) or []:
+        if rel.get("Type") == kind:
+            for cid in rel.get("Ids", []):
+                if cid in by_id:
+                    yield by_id[cid]
+
+
+def tx_cell_text(cell, by_id):
+    parts = []
+    for child in tx_children(cell, by_id):
+        if child["BlockType"] == "WORD":
+            parts.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            parts.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(parts).replace("|", "\\|").strip()
+
+
+def tx_table_rows(table, by_id):
+    cells = {}
+    for cell in tx_children(table, by_id):
+        if cell["BlockType"] == "CELL":
+            cells[(cell["RowIndex"], cell["ColumnIndex"])] = tx_cell_text(cell, by_id)
+    if not cells:
+        return []
+    n_rows = max(r for r, _ in cells)
+    n_cols = max(c for _, c in cells)
+    return [[cells.get((r, c), "") for c in range(1, n_cols + 1)] for r in range(1, n_rows + 1)]
+
+
+def tx_markdown_table(rows):
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * len(rows[0])]
+    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return "\n".join(lines)
+
+
+TX_NUMBERED = re.compile(r"^(?:(\d+(?:\.\d+)*)\.?|([IVX]+)\.|([A-H])\.)\s+[A-Z]")
+TX_NAMED = {"abstract", "references", "acknowledgments", "acknowledgements", "conclusion", "conclusions",
+         "introduction", "appendix", "bibliography"}
+
+
+def tx_heading_level(text, height, body_height):
+    """1-6 if the line looks like a heading, else 0. Needs a short line that does not end like a sentence."""
+    words = text.split()
+    if not 1 <= len(words) <= 12 or text.endswith((".", ",", ";", ":")) or text.startswith(("Table", "Figure", "Fig.")):
+        return 0
+    bigger = body_height and height >= body_height * 1.15
+    m = TX_NUMBERED.match(text)
+    if m and height >= body_height * 0.97:
+        if m.group(1):
+            return min(6, m.group(1).count(".") + 2)
+        return 2 if m.group(2) else 3
+    if text.lower().rstrip(":") in TX_NAMED and height >= body_height * 0.97:
+        return 2
+    if bigger and len(words) >= 2 and not text.islower():
+        return 1
+    return 0
+
+
+def tx_textract_to_markdown(blocks):
+    by_id = {b["Id"]: b for b in blocks if "Id" in b}
+    # which table does each word belong to?
+    word_table = {}
+    for block in blocks:
+        if block.get("BlockType") == "TABLE":
+            for cell in tx_children(block, by_id):
+                for word in tx_children(cell, by_id):
+                    word_table[word["Id"]] = block["Id"]
+    heights = [b["Geometry"]["BoundingBox"]["Height"] for b in blocks
+               if b.get("BlockType") == "LINE" and "Geometry" in b]
+    body_height = __import__('statistics').median(heights) if heights else 0
+    out, done = [], set()
+    for block in blocks:
+        if block.get("BlockType") != "LINE":
+            continue
+        words = [w["Id"] for w in tx_children(block, by_id) if w["BlockType"] == "WORD"]
+        tables = {word_table[w] for w in words if w in word_table}
+        if tables and len(tables) == 1 and all(w in word_table for w in words):
+            tid = tables.pop()
+            if tid not in done:
+                done.add(tid)
+                rows = tx_table_rows(by_id[tid], by_id)
+                if rows:
+                    out.append(tx_markdown_table(rows))
+            continue
+        text = block.get("Text", "").strip()
+        if text:
+            height = block.get("Geometry", {}).get("BoundingBox", {}).get("Height", 0)
+            level = tx_heading_level(text, height, body_height) if body_height else 0
+            out.append(f"{'#' * level} {text}" if level else text)
+    # tables whose words never showed up as a line still count
+    for block in blocks:
+        if block.get("BlockType") == "TABLE" and block["Id"] not in done:
+            rows = tx_table_rows(block, by_id)
+            if rows:
+                out.append(tx_markdown_table(rows))
+    return "\n\n".join(out) + "\n"
+
+
 TEXTRACT_MAX_WAIT = 300  # seconds to wait for Textract before giving up
 
 
 def convert_with_textract(file_path):
     """Amazon Textract (tables feature): the PDF goes to S3, Textract reads it, the blocks become Markdown.
 
-    Textract returns lines and table cells only, so the Markdown has no headings.
+    Textract returns lines and table cells only, so headings are found from line size and numbering.
     """
     import time
-
-    try:
-        from api.textract_to_md import textract_to_markdown
-    except ImportError:  # the server was started from inside the api folder
-        from textract_to_md import textract_to_markdown
 
     if not BUCKET:
         raise HTTPException(status_code=503, detail="Textract needs the S3_BUCKET setting.")
@@ -851,7 +960,7 @@ def convert_with_textract(file_path):
             blocks.extend(result["Blocks"])
     finally:
         s3.delete_object(Bucket=BUCKET, Key=key)
-    markdown = textract_to_markdown(blocks)
+    markdown = tx_textract_to_markdown(blocks)
     try:
         # Textract cannot read equations, so the column reader's LaTeX formulas are put in their places
         markdown = recognize_docling_formulas(markdown, file_path)
