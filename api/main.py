@@ -924,6 +924,32 @@ def tx_textract_to_markdown(blocks):
     return "\n\n".join(out) + "\n"
 
 
+def tx_drop_picture_text(blocks, file_path):
+    """Textract also reads the text printed inside figures and pictures (axis labels, legends). Those lines are
+    removed here, so a figure shows only as its image link."""
+    import pdfplumber
+
+    boxes = {}
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page in pdf.pages:
+            found = [tuple(b) for b in find_figure_regions(page)]
+            for img in page.images:
+                found.append((img["x0"], img["top"], img["x1"], img["bottom"]))
+            boxes[page.page_number] = (page.width, page.height, found)
+    kept = []
+    for block in blocks:
+        if block.get("BlockType") == "LINE":
+            width, height, found = boxes.get(block.get("Page", 1), (0, 0, []))
+            box = block.get("Geometry", {}).get("BoundingBox", {})
+            if found and box:
+                cx = (box["Left"] + box["Width"] / 2) * width
+                cy = (box["Top"] + box["Height"] / 2) * height
+                if any(x0 - 2 <= cx <= x1 + 2 and top - 2 <= cy <= bottom + 2 for x0, top, x1, bottom in found):
+                    continue
+        kept.append(block)
+    return kept
+
+
 TEXTRACT_MAX_WAIT = 300  # seconds to wait for Textract before giving up
 
 
@@ -960,6 +986,10 @@ def convert_with_textract(file_path):
             blocks.extend(result["Blocks"])
     finally:
         s3.delete_object(Bucket=BUCKET, Key=key)
+    try:
+        blocks = tx_drop_picture_text(blocks, file_path)
+    except Exception:
+        pass  # keep all of Textract's lines if the figures cannot be located
     markdown = tx_textract_to_markdown(blocks)
     try:
         # Textract cannot read equations, so the column reader's LaTeX formulas are put in their places
