@@ -7,8 +7,7 @@ import streamlit as st
 # The backend. It defaults to the deployed Render service. To run everything on your own computer,
 # set the API_URL environment variable to http://localhost:8000 before starting the app.
 API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
-
-TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract"}
+TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract", "engine": "Our engine"}
 
 st.set_page_config(page_title="Unstructured Data Ingestion Pipeline", layout="wide")
 st.title("Unstructured Data Ingestion Pipeline")
@@ -62,7 +61,7 @@ tab1, tab2 = st.tabs(["Upload PDF", "Submit URL"])
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
-    tool = st.selectbox("Conversion tool", ["markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"])
+    tool = st.selectbox("Conversion tool", ["engine", "markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"])
 
     if tool == "azure":
         st.info(
