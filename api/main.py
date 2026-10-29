@@ -32,6 +32,7 @@ app.add_middleware(
 session = boto3.Session(
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    aws_session_token=os.getenv("AWS_SESSION_TOKEN") or None,  # temporary keys from the AWS portal need this
     region_name=os.getenv("AWS_REGION"),
 )
 s3 = session.client("s3")
@@ -82,7 +83,7 @@ def upload_table(key, name, rows, metadata):
     }
 
 
-PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber", "azure", "textract")
+PDF_TOOLS = ("docling", "markitdown", "pypdf", "pdfplumber", "azure", "textract", "engine")
 URL_TOOLS = ("beautifulsoup", "azure", "pypdf", "pdfplumber")
 
 
@@ -929,28 +930,54 @@ def tx_textract_to_markdown(blocks, page_marks=False):
 
 def tx_drop_picture_text(blocks, file_path):
     """Textract also reads the text printed inside figures and pictures (axis labels, legends). Those lines are
-    removed here, so a figure shows only as its image link."""
+    removed, so a figure shows only as its image link. The exception is an equation printed as a picture: its
+    lines are kept and joined into one line, so the formula is printed as text."""
     import pdfplumber
 
     boxes = {}
     with pdfplumber.open(str(file_path)) as pdf:
         for page in pdf.pages:
-            found = [tuple(b) for b in find_figure_regions(page)]
+            figures = [tuple(b) for b in find_figure_regions(page)]
+            equations = []
             for img in page.images:
-                found.append((img["x0"], img["top"], img["x1"], img["bottom"]))
-            boxes[page.page_number] = (page.width, page.height, found)
-    kept = []
+                box = (img["x0"], img["top"], img["x1"], img["bottom"])
+                width, height = box[2] - box[0], box[3] - box[1]
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                inside_figure = any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures)
+                if height < 60 and width > 3 * height and not inside_figure:
+                    equations.append(box)  # same test as the image saver, which skips these pictures
+                elif not inside_figure:
+                    figures.append(box)
+            boxes[page.page_number] = (page.width, page.height, figures, equations)
+
+    def inside(box, cx, cy):
+        return box[0] - 2 <= cx <= box[2] + 2 and box[1] - 2 <= cy <= box[3] + 2
+
+    kept, equation_lines = [], {}
     for block in blocks:
         if block.get("BlockType") == "LINE":
-            width, height, found = boxes.get(block.get("Page", 1), (0, 0, []))
-            box = block.get("Geometry", {}).get("BoundingBox", {})
-            if found and box:
-                cx = (box["Left"] + box["Width"] / 2) * width
-                cy = (box["Top"] + box["Height"] / 2) * height
-                if any(x0 - 2 <= cx <= x1 + 2 and top - 2 <= cy <= bottom + 2 for x0, top, x1, bottom in found):
+            width, height, figures, equations = boxes.get(block.get("Page", 1), (0, 0, [], []))
+            geo = block.get("Geometry", {}).get("BoundingBox", {})
+            if geo and (figures or equations):
+                cx = (geo["Left"] + geo["Width"] / 2) * width
+                cy = (geo["Top"] + geo["Height"] / 2) * height
+                if any(inside(f, cx, cy) for f in figures):
+                    continue
+                hit = next((i for i, e in enumerate(equations) if inside(e, cx, cy)), None)
+                if hit is not None:
+                    key = (block.get("Page", 1), hit)
+                    if key in equation_lines:
+                        equation_lines[key]["lines"].append(block)
+                        continue
+                    equation_lines[key] = {"lines": [block], "slot": len(kept)}
+                    kept.append(None)  # the joined equation goes here
                     continue
         kept.append(block)
-    return kept
+    for group in equation_lines.values():
+        lines = sorted(group["lines"], key=lambda b: (round(b["Geometry"]["BoundingBox"]["Left"] * 80), b["Geometry"]["BoundingBox"]["Top"]))
+        first = group["lines"][0]
+        kept[group["slot"]] = {**first, "Text": " ".join(b.get("Text", "") for b in lines), "Relationships": []}
+    return [b for b in kept if b is not None]
 
 
 TEXTRACT_MAX_WAIT = 300  # seconds to wait for Textract before giving up
@@ -2086,6 +2113,16 @@ def order_docling_like_reader(text, reader):
     return "\n\n".join(blocks)
 
 
+def convert_with_engine(file_path):
+    """Our own engine: typed elements with confidence scores, merged in reading order into Markdown."""
+    from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
+
+    # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
+    doc = extract_pdf(file_path, image_store=lambda name, png: "")
+    doc.elements = [e for e in doc.elements if e.type != "image"]
+    return doc.to_markdown()
+
+
 def convert_pdf(file_path, tool):
     if tool == "docling":
         text = convert_with_docling(file_path)
@@ -2107,6 +2144,8 @@ def convert_pdf(file_path, tool):
         return convert_with_azure(file_path)
     elif tool == "textract":
         return convert_with_textract(file_path)
+    elif tool == "engine":
+        return convert_with_engine(file_path)
     else:
         raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
@@ -2348,11 +2387,11 @@ def split_raster_panels(page, box):
         if width < 200 or height < 60:
             return []
         pixels = crop.load()
-        rows = range(0, height, 2)
+        # The strip must be empty from the top edge to the bottom edge. A single chart has its frame or axis
+        # lines running across any gap between its bars, so only two separate plots leave a fully white strip.
         white = []
         for x in range(width):
-            dark = sum(1 for y in rows if pixels[x, y] < 235)
-            white.append(dark <= 0.01 * len(rows))
+            white.append(all(pixels[x, y] >= 245 for y in range(height)))
         best, start = None, None
         for x, is_white in enumerate(white + [False]):
             if is_white and start is None:
@@ -2586,6 +2625,9 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 )
                 if box[2] - box[0] < 20 or box[3] - box[1] < 20:
                     continue
+                width, height = box[2] - box[0], box[3] - box[1]
+                if height < 60 and width > 3 * height:
+                    continue  # a short, wide strip is an equation printed as a picture, not an image
                 cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
                 inside_figure = any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures)
                 if not inside_figure:  # pictures inside a saved figure are already part of it
